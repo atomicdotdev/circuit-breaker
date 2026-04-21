@@ -181,16 +181,165 @@ impl Runner {
 
         match action {
             Action::Dagger(dagger_action) => {
-                self.execute_dagger(&dagger_action, &msg.environment, &msg.input_tokens).await
+                self.execute_dagger(&dagger_action, &msg.environment, &msg.input_tokens)
+                    .await
             }
             Action::Http(http_action) => self.execute_http(&http_action).await,
             Action::Script(script_action) => {
-                self.execute_script(&script_action, &msg.environment, transition_ref, &msg.input_tokens).await
+                self.execute_script(
+                    &script_action,
+                    &msg.environment,
+                    transition_ref,
+                    &msg.input_tokens,
+                )
+                .await
+            }
+            Action::Circuit(circuit_action) => {
+                self.execute_circuit(&circuit_action, &msg.environment, transition_ref)
+                    .await
             }
             Action::Noop => {
                 debug!("Executing noop action");
-                Ok(serde_json::json!({"status": "done", "message": "Workflow completed successfully"}))
+                Ok(
+                    serde_json::json!({"status": "done", "message": "Workflow completed successfully"}),
+                )
             }
+        }
+    }
+
+    /// Execute a circuit action — runs a shell command inside a SmolVM.
+    ///
+    /// Uses the `circuit` CLI via subprocess. The VM is managed per workflow
+    /// run: created on the first circuit action, reused for subsequent actions.
+    async fn execute_circuit(
+        &self,
+        action: &cb_core::workflow::CircuitAction,
+        env: &HashMap<String, String>,
+        transition_ref: &TransitionRef,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let image = action.image.as_deref().unwrap_or("ubuntu:24.04");
+        let vm_name = format!("cb-run-{}", &transition_ref.run_id.to_string()[..8]);
+
+        info!(
+            vm_name = %vm_name,
+            image = %image,
+            command = %action.command,
+            "Executing circuit action"
+        );
+
+        // Check if the VM already exists (reuse across transitions in the same run)
+        let ls_output = Command::new("circuit")
+            .args(["machine", "ls", "--json"])
+            .output()
+            .await?;
+
+        let ls_text = String::from_utf8_lossy(&ls_output.stdout);
+        let is_running = ls_text.contains(&vm_name) && ls_text.contains("running");
+
+        if !is_running {
+            info!(vm_name = %vm_name, image = %image, "Creating circuit VM");
+
+            let source_dir = std::env::current_dir()?.display().to_string();
+
+            let create_output = Command::new("circuit")
+                .args([
+                    "machine",
+                    "create",
+                    "--image",
+                    image,
+                    "--net",
+                    "--volume",
+                    &format!("{}:/projects", source_dir),
+                    &vm_name,
+                ])
+                .output()
+                .await?;
+
+            if !create_output.status.success() {
+                let stderr = String::from_utf8_lossy(&create_output.stderr);
+                return Err(format!("Failed to create circuit VM: {}", stderr).into());
+            }
+
+            let start_output = Command::new("circuit")
+                .args(["machine", "start", "--name", &vm_name])
+                .output()
+                .await?;
+
+            if !start_output.status.success() {
+                let stderr = String::from_utf8_lossy(&start_output.stderr);
+                return Err(format!("Failed to start circuit VM: {}", stderr).into());
+            }
+
+            info!(vm_name = %vm_name, "Circuit VM ready");
+        } else {
+            debug!(vm_name = %vm_name, "Reusing existing circuit VM");
+        }
+
+        // Each `circuit machine exec` is a fresh shell session — env vars
+        // don't carry over, but files on the persistent overlay do.
+        // The action resolver writes env/path changes to well-known files
+        // at /tmp/.cb/github_env and /tmp/.cb/github_path. Source them
+        // before every command so changes from prior transitions persist.
+        let full_command = format!(
+            r#"if [ -f /tmp/.cb/github_env ]; then while IFS= read -r _l || [ -n "$_l" ]; do [ -n "$_l" ] && export "$_l"; done < /tmp/.cb/github_env; fi; \
+               if [ -f /tmp/.cb/github_path ]; then while IFS= read -r _l || [ -n "$_l" ]; do [ -n "$_l" ] && export PATH="$_l:$PATH"; done < /tmp/.cb/github_path; fi; \
+               cd {} && {}"#,
+            action.workdir, action.command
+        );
+
+        let start = std::time::Instant::now();
+        let output = Command::new("circuit")
+            .args([
+                "machine",
+                "exec",
+                "--name",
+                &vm_name,
+                "--",
+                "bash",
+                "-c",
+                &full_command,
+            ])
+            .output()
+            .await?;
+        let duration = start.elapsed();
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        // Publish logs to NATS
+        let log_payload = serde_json::json!({
+            "transitionRef": transition_ref,
+            "command": action.command,
+            "image": image,
+            "stdout": &stdout[..stdout.len().min(10000)],
+            "stderr": &stderr[..stderr.len().min(10000)],
+            "exitCode": output.status.code(),
+            "durationMs": duration.as_millis(),
+        });
+
+        let subject = format!(
+            "cb.runs.{}.logs.{}",
+            transition_ref.run_id, transition_ref.transition_id
+        );
+
+        if let Err(e) = self.nats.publish_jetstream(&subject, &log_payload).await {
+            warn!(error = %e, "Failed to publish circuit log to NATS");
+        }
+
+        if output.status.success() {
+            Ok(serde_json::json!({
+                "status": "success",
+                "output": stdout,
+                "exitCode": 0,
+                "durationMs": duration.as_millis() as u64,
+            }))
+        } else {
+            Err(format!(
+                "Circuit command failed (exit {}): {}",
+                output.status.code().unwrap_or(-1),
+                if stderr.is_empty() { &stdout } else { &stderr }
+            )
+            .into())
         }
     }
 
@@ -678,8 +827,14 @@ globalThis.ctx = {};
                     if parsed.get("__cb_publish").is_some() {
                         // This is a publish() call - forward to NATS and collect for output
                         let message = parsed.get("message").and_then(|m| m.as_str()).unwrap_or("");
-                        let level = parsed.get("level").and_then(|l| l.as_str()).unwrap_or("info");
-                        let timestamp = parsed.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
+                        let level = parsed
+                            .get("level")
+                            .and_then(|l| l.as_str())
+                            .unwrap_or("info");
+                        let timestamp = parsed
+                            .get("timestamp")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("");
 
                         // Collect for output
                         published_messages.push(serde_json::json!({

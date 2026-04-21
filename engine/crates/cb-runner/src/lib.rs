@@ -79,8 +79,8 @@ use std::time::Duration;
 
 use tokio::sync::Mutex;
 
-use cb_core::workflow::{Action, PolicyGate};
 use cb_core::error::Result;
+use cb_core::workflow::{Action, PolicyGate};
 
 /// Configuration for the runner.
 #[derive(Debug, Clone)]
@@ -248,20 +248,22 @@ impl ActionExecutor {
     ///
     /// If a policy gate is configured in the context, the action outputs
     /// will be validated against the policy after execution.
-    pub async fn execute(&self, action: &Action, context: ExecutionContext) -> Result<ExecutionResult> {
+    pub async fn execute(
+        &self,
+        action: &Action,
+        context: ExecutionContext,
+    ) -> Result<ExecutionResult> {
         let start = std::time::Instant::now();
 
         let result = match action {
-            Action::Dagger(dagger_action) => {
-                self.execute_dagger(dagger_action, &context).await
-            }
-            Action::Http(http_action) => {
-                self.execute_http(http_action, &context).await
-            }
-            Action::Script(script_action) => {
-                self.execute_script(script_action, &context).await
-            }
-            Action::Noop => {
+            Action::Dagger(dagger_action) => self.execute_dagger(dagger_action, &context).await,
+            Action::Http(http_action) => self.execute_http(http_action, &context).await,
+            Action::Script(script_action) => self.execute_script(script_action, &context).await,
+            Action::Circuit(_circuit_action) => {
+                // Circuit actions are handled by the main.rs runner via
+                // `circuit machine exec`. The lib executor delegates to
+                // the same Dagger path for now — the real circuit execution
+                // path is in main.rs::execute_circuit().
                 Ok(ExecutionResult {
                     success: true,
                     outputs: None,
@@ -272,6 +274,15 @@ impl ActionExecutor {
                     logs: None,
                 })
             }
+            Action::Noop => Ok(ExecutionResult {
+                success: true,
+                outputs: None,
+                artifacts: vec![],
+                duration: start.elapsed(),
+                resource_usage: ResourceUsage::default(),
+                error: None,
+                logs: None,
+            }),
         };
 
         // If action succeeded and policy is configured, validate outputs
@@ -368,7 +379,9 @@ impl ActionExecutor {
                                     None
                                 }
                             } else {
-                                tracing::debug!("No input_data available for token interpolation, skipping arg");
+                                tracing::debug!(
+                                    "No input_data available for token interpolation, skipping arg"
+                                );
                                 None
                             }
                         } else {
@@ -500,8 +513,10 @@ impl ActionExecutor {
                         "conftest",
                         "test",
                         "/input.json",
-                        "--policy", "/policies",
-                        "--output", "json",
+                        "--policy",
+                        "/policies",
+                        "--output",
+                        "json",
                     ])
                     .stdout()
                     .await;
@@ -523,8 +538,8 @@ impl ActionExecutor {
                 match captured {
                     Some(Ok(json_output)) => {
                         // Parse conftest JSON output
-                        let parsed: serde_json::Value = serde_json::from_str(&json_output)
-                            .unwrap_or(serde_json::json!([]));
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(&json_output).unwrap_or(serde_json::json!([]));
 
                         let mut violations = Vec::new();
                         let mut warnings = Vec::new();
@@ -533,17 +548,24 @@ impl ActionExecutor {
                         if let Some(results) = parsed.as_array() {
                             for result in results {
                                 // Check failures
-                                if let Some(failures) = result.get("failures").and_then(|f| f.as_array()) {
+                                if let Some(failures) =
+                                    result.get("failures").and_then(|f| f.as_array())
+                                {
                                     for failure in failures {
-                                        if let Some(msg) = failure.get("msg").and_then(|m| m.as_str()) {
+                                        if let Some(msg) =
+                                            failure.get("msg").and_then(|m| m.as_str())
+                                        {
                                             violations.push(msg.to_string());
                                         }
                                     }
                                 }
                                 // Check warnings
-                                if let Some(warns) = result.get("warnings").and_then(|w| w.as_array()) {
+                                if let Some(warns) =
+                                    result.get("warnings").and_then(|w| w.as_array())
+                                {
                                     for warn in warns {
-                                        if let Some(msg) = warn.get("msg").and_then(|m| m.as_str()) {
+                                        if let Some(msg) = warn.get("msg").and_then(|m| m.as_str())
+                                        {
                                             warnings.push(msg.to_string());
                                         }
                                     }
@@ -562,14 +584,10 @@ impl ActionExecutor {
                         // conftest execution failed - might be policy violations
                         Err(eyre::eyre!("conftest failed: {}", e))
                     }
-                    None => {
-                        Err(eyre::eyre!("No output captured from conftest"))
-                    }
+                    None => Err(eyre::eyre!("No output captured from conftest")),
                 }
             }
-            Err(e) => {
-                Err(eyre::eyre!("Dagger connection failed: {}", e))
-            }
+            Err(e) => Err(eyre::eyre!("Dagger connection failed: {}", e)),
         }
     }
 
@@ -641,17 +659,15 @@ impl ActionExecutor {
                     logs: Some(body),
                 })
             }
-            Err(e) => {
-                Ok(ExecutionResult {
-                    success: false,
-                    outputs: None,
-                    artifacts: vec![],
-                    duration: start.elapsed(),
-                    resource_usage: ResourceUsage::default(),
-                    error: Some(e.to_string()),
-                    logs: None,
-                })
-            }
+            Err(e) => Ok(ExecutionResult {
+                success: false,
+                outputs: None,
+                artifacts: vec![],
+                duration: start.elapsed(),
+                resource_usage: ResourceUsage::default(),
+                error: Some(e.to_string()),
+                logs: None,
+            }),
         }
     }
 
@@ -700,9 +716,7 @@ impl ActionExecutor {
             let output_ref = output_ref.clone();
 
             async move {
-                let mut container = client
-                    .container()
-                    .from(&image);
+                let mut container = client.container().from(&image);
 
                 // Add environment variables
                 for (key, value) in env {
@@ -742,57 +756,47 @@ impl ActionExecutor {
         let captured = output_capture.lock().await.take();
 
         match script_result {
-            Ok(()) => {
-                match captured {
-                    Some(Ok(output)) => {
-                        Ok(ExecutionResult {
-                            success: true,
-                            outputs: Some(serde_json::json!({
-                                "runtime": format!("{:?}", action.runtime),
-                                "output": output,
-                            })),
-                            artifacts: vec![],
-                            duration: start.elapsed(),
-                            resource_usage: ResourceUsage::default(),
-                            error: None,
-                            logs: Some(output),
-                        })
-                    }
-                    Some(Err(e)) => {
-                        Ok(ExecutionResult {
-                            success: false,
-                            outputs: None,
-                            artifacts: vec![],
-                            duration: start.elapsed(),
-                            resource_usage: ResourceUsage::default(),
-                            error: Some(e),
-                            logs: None,
-                        })
-                    }
-                    None => {
-                        Ok(ExecutionResult {
-                            success: false,
-                            outputs: None,
-                            artifacts: vec![],
-                            duration: start.elapsed(),
-                            resource_usage: ResourceUsage::default(),
-                            error: Some("No output captured from script".to_string()),
-                            logs: None,
-                        })
-                    }
-                }
-            }
-            Err(e) => {
-                Ok(ExecutionResult {
+            Ok(()) => match captured {
+                Some(Ok(output)) => Ok(ExecutionResult {
+                    success: true,
+                    outputs: Some(serde_json::json!({
+                        "runtime": format!("{:?}", action.runtime),
+                        "output": output,
+                    })),
+                    artifacts: vec![],
+                    duration: start.elapsed(),
+                    resource_usage: ResourceUsage::default(),
+                    error: None,
+                    logs: Some(output),
+                }),
+                Some(Err(e)) => Ok(ExecutionResult {
                     success: false,
                     outputs: None,
                     artifacts: vec![],
                     duration: start.elapsed(),
                     resource_usage: ResourceUsage::default(),
-                    error: Some(e.to_string()),
+                    error: Some(e),
                     logs: None,
-                })
-            }
+                }),
+                None => Ok(ExecutionResult {
+                    success: false,
+                    outputs: None,
+                    artifacts: vec![],
+                    duration: start.elapsed(),
+                    resource_usage: ResourceUsage::default(),
+                    error: Some("No output captured from script".to_string()),
+                    logs: None,
+                }),
+            },
+            Err(e) => Ok(ExecutionResult {
+                success: false,
+                outputs: None,
+                artifacts: vec![],
+                duration: start.elapsed(),
+                resource_usage: ResourceUsage::default(),
+                error: Some(e.to_string()),
+                logs: None,
+            }),
         }
     }
 }
@@ -837,8 +841,8 @@ pub async fn execute_action_with_policy(
 /// Prelude for convenient imports.
 pub mod prelude {
     pub use crate::{
-        execute_action, execute_action_with_policy, ActionExecutor, Artifact,
-        ExecutionContext, ExecutionResult, PolicyResult, ResourceUsage, RunnerConfig,
+        execute_action, execute_action_with_policy, ActionExecutor, Artifact, ExecutionContext,
+        ExecutionResult, PolicyResult, ResourceUsage, RunnerConfig,
     };
 }
 

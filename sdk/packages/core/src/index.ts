@@ -48,6 +48,33 @@ export {
   type TaskAction,
 } from "./workflow";
 
+// GitHub Actions YAML converter
+export {
+  fromGitHubActions,
+  fromGitHubActionsFile,
+  type ConvertOptions,
+  type GitHubActionsWorkflow,
+} from "./github-actions";
+
+// GitHub Actions composite action resolver
+export {
+  resolveAction,
+  clearActionCache,
+  type ResolvedStep,
+} from "./action-resolver";
+
+// Sealed runner baseline
+export {
+  BASELINE_PACKAGES,
+  BASELINE_INSTALL_SCRIPT,
+  BASELINE_INSTALL_STEPS,
+  GITHUB_ACTIONS_SHIM,
+  RUN_STEP_PREAMBLE,
+  runnerCacheKey,
+  runnerCachePath,
+  RUNNER_CACHE_DIR,
+} from "./runner-baseline";
+
 // OpenCode AI agent integration
 export {
   opencode,

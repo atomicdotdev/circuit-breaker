@@ -496,6 +496,26 @@ export class TransitionBuilder {
   }
 
   /**
+   * Configure the transition to run a shell command inside a SmolVM.
+   *
+   * @param command - Shell command to execute inside the VM
+   * @param options - Optional image, shell, and workdir overrides
+   */
+  circuit(
+    command: string,
+    options?: { image?: string; shell?: string; workdir?: string },
+  ): this {
+    this._transition.action = {
+      type: "circuit" as any,
+      command,
+      image: options?.image,
+      shell: options?.shell ?? "sh",
+      workdir: options?.workdir ?? "/workspace",
+    };
+    return this;
+  }
+
+  /**
    * Configure as a no-op transition (for synchronization points like fan-in joins).
    */
   noop(): this {

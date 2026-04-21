@@ -203,8 +203,43 @@ pub enum Action {
     Http(HttpAction),
     /// Run an inline script.
     Script(ScriptAction),
+    /// Run a shell command inside a SmolVM via circuit-vm.
+    Circuit(CircuitAction),
     /// No-op (for synchronization points).
     Noop,
+}
+
+/// Circuit VM action — runs a shell command inside a hardware-isolated SmolVM.
+///
+/// The runner boots a persistent SmolVM from the specified OCI image,
+/// mounts the source directory at `/workspace`, and executes the command
+/// via `circuit machine exec`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CircuitAction {
+    /// Shell command to execute inside the VM.
+    pub command: String,
+
+    /// OCI image for the VM (e.g., "ubuntu:24.04", "rust:stable").
+    /// Resolved from `runs-on:` in GitHub Actions YAML.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+
+    /// Shell to use (default: "sh").
+    #[serde(default = "default_shell")]
+    pub shell: String,
+
+    /// Working directory inside the VM (default: "/workspace").
+    #[serde(default = "default_workdir")]
+    pub workdir: String,
+}
+
+fn default_shell() -> String {
+    "sh".to_string()
+}
+
+fn default_workdir() -> String {
+    "/workspace".to_string()
 }
 
 /// Dagger pipeline action.
