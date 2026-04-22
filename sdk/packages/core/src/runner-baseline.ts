@@ -273,11 +273,21 @@ if [ -f /tmp/.cb/github_path ]; then
   done < /tmp/.cb/github_path
 fi
 
-# Use the VM's local disk for build artifacts — virtiofs mounts are
-# fast for reads but very slow for the heavy write I/O that compilers
-# produce (cargo writes thousands of files to target/).
+# Use the VM's local disk for ALL write-heavy I/O — virtiofs mounts are
+# fast for reads but very slow for writes. Compilers, test runners, and
+# package managers all produce heavy write I/O that must stay on local disk.
+
+# Build artifacts (cargo, go, gradle, etc.)
 export CARGO_TARGET_DIR=/tmp/cargo-target
 mkdir -p /tmp/cargo-target
+
+# Temp files — tests use tempfile/tempdir crates, and many tools write
+# scratch data to TMPDIR. Without this, test I/O goes through virtiofs.
+export TMPDIR=/tmp
+export TEMPDIR=/tmp
+export RUST_TEST_TMPDIR=/tmp
+export XDG_CACHE_HOME=/tmp/cache
+mkdir -p /tmp/cache
 `.trim();
 
 // ============ Cache Key ============

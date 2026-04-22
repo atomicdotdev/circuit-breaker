@@ -475,3 +475,229 @@ The key insight: **`uses:` steps tell you what to install, not what to run.** Yo
 4. **Cache key computation** — hash the `uses:` references + `with:` inputs to produce a cache key. If the key matches an existing `.smolmachine`, skip the build.
 
 5. **Demo tomorrow** — build a Rust runner from the shell, register it, show CB dispatching `run:` steps to it via the Petri net. No `uses:` resolution needed for the demo — the runner is pre-built.
+
+---
+
+## What We Built (April 21–22, 2026 — Working Implementation)
+
+### End-to-End Sealed Runner Pipeline
+
+Everything from the April 21 design session is now implemented and working. `cb check` reads a GitHub Actions YAML, builds a sealed SmolVM runner with all tools pre-baked, caches it, and executes `run:` steps inside it.
+
+**Proven against two real projects:**
+
+- `circuit-vm` (small Rust workspace, 3 run steps) — **30s total, 2.2s warm**
+- `atomic` (large Rust workspace, 6 jobs, 1200+ tests) — **2m43s cold, 2.4s warm**
+
+**Comparison with GitHub Actions (atomic project):**
+
+| Scenario | Time | vs GitHub Actions (45min) |
+|----------|------|--------------------------|
+| GitHub Actions | **45 minutes** | baseline |
+| `cb check` cold (build sealed runner + first compile) | **2m43s** | 17x faster |
+| `cb check` warm (VM reused, incremental compile) | **2.4s** | 1,125x faster |
+
+### Files Created / Modified
+
+**New files in circuit-breaker:**
+
+| File | Purpose |
+|------|---------|
+| `sdk/packages/core/src/runner-baseline.ts` | 29 baseline apt packages, install scripts (7 steps), GitHub Actions env shim, run step preamble, cache key computation, runner cache paths |
+| `sdk/packages/cli/src/commands/check.ts` | Complete rewrite — sealed runner pipeline: parse → build → cache → run → report |
+
+**Modified files in circuit-breaker:**
+
+| File | Change |
+|------|--------|
+| `sdk/packages/core/src/index.ts` | Export runner-baseline symbols |
+| `sdk/packages/core/src/action-resolver.ts` | Node.js action support (download + `node dist/index.js`), merged `with:` inputs across jobs |
+| `sdk/packages/cli/package.json` | Added `yaml` dependency |
+
+**Modified files in circuit-vm:**
+
+| File | Change |
+|------|--------|
+| `crates/circuit-core/src/outlet.rs` | Redesigned with Source/Scratch/Output I/O directions, presets for Rust/Go/Node/Python/Gradle/Maven, auto-detection |
+| `crates/circuit-core/src/lib.rs` | Updated exports for new outlet types |
+| `crates/circuit-core/Cargo.toml` | Added tempfile dev-dependency |
+
+**Modified files in atomic:**
+
+| File | Change |
+|------|--------|
+| `.github/workflows/ci.yml` | Switched from `actions-rs/toolchain@v1` (Node, deprecated) to `dtolnay/rust-toolchain@stable` (composite). Replaced 7 individual `cargo test -p` with `cargo test --workspace`. |
+| Various source files | Fixed clippy warnings: `sort_by` → `sort_by_key`, match guard refactoring in parsers |
+
+### How the Pipeline Works
+
+```
+cb check -w .github/workflows/ci.yml -s /path/to/project
+│
+├─ PARSE
+│  ├─ fromGitHubActionsFile() validates the workflow
+│  ├─ Raw YAML parsed to separate uses: from run: steps
+│  ├─ Matrix jobs resolved to ubuntu variant
+│  ├─ uses: steps merged across jobs (components unioned)
+│  └─ Cache key: SHA-256(baseline-v1 + image + sorted uses + with)
+│
+├─ BUILD (skipped if ~/.cb/runners/<key>.smolmachine exists)
+│  ├─ smolvm machine create --image ubuntu:24.04 --net cb-build-<key>
+│  ├─ 7 sequential apt-get installs (29 packages, ~26s total):
+│  │   update → essential → archive → build-toolchain → system → utilities → cleanup
+│  ├─ GitHub Actions environment shim (GITHUB_OUTPUT/ENV/PATH)
+│  ├─ For each unique uses: step:
+│  │   ├─ Composite actions: fetch action.yml, substitute inputs, exec script
+│  │   └─ Node actions: download action tarball, install Node binary, run node dist/index.js
+│  ├─ smolvm machine stop (required before seal)
+│  ├─ smolvm pack create --from-vm → ~/.cb/runners/<key>.smolmachine
+│  └─ Delete builder VM
+│
+├─ BOOT (or reuse existing stopped VM)
+│  ├─ If cb-check VM exists and stopped → smolvm machine start (259ms)
+│  ├─ If cb-check VM exists and running → reuse as-is (0ms)
+│  └─ If no VM → smolvm machine create --from <key>.smolmachine
+│       --net --volume <parent>:/projects cb-check
+│
+├─ RUN (for each job, for each run: step)
+│  ├─ Preamble: source github_env + github_path from build phase
+│  ├─ Set CARGO_TARGET_DIR=/tmp/cargo-target (VM local disk)
+│  ├─ Set TMPDIR=/tmp (avoid virtiofs for test temp files)
+│  ├─ cd /projects/<project-name>
+│  ├─ smolvm machine exec --name cb-check -- bash -c "<command>"
+│  └─ Stream stdout/stderr live to terminal
+│
+├─ STOP (not delete — preserves overlay with target/ cache)
+│  └─ smolvm machine stop --name cb-check
+│
+└─ REPORT
+   ├─ Pass/fail per step with timing
+   ├─ --json for structured output
+   └─ --from <step> for retry from failure
+```
+
+### Key Discoveries
+
+#### 1. Baseline Packages (29 packages, 7 groups)
+
+A bare `ubuntu:24.04` OCI image is missing almost everything. We defined the practical minimum:
+
+| Group | Packages |
+|-------|----------|
+| Essential | bash, curl, wget, ca-certificates, git |
+| Archive | tar, unzip, xz-utils, zip, gzip, bzip2 |
+| Build | build-essential, pkg-config, libssl-dev, autoconf, automake, libtool |
+| System | sudo, gnupg, openssh-client, software-properties-common, apt-transport-https, lsb-release |
+| Utilities | jq, file, locales, python3, python3-pip, python-is-python3 |
+
+Installing all 29 in a single `apt-get install` caused pipe-buffering hangs with `Bun.spawn`. Splitting into 7 sequential execs (one per group) fixed it and enables live progress streaming.
+
+**Not in baseline:** `nodejs` / `npm`. The apt package pulls in 382 dependencies. Instead, Node.js is installed on-demand as a standalone binary (~5s) when a Node-based action is encountered.
+
+#### 2. Virtiofs: Fast Reads, Catastrophic Writes
+
+The defining performance discovery. Source mounted via virtiofs (host → VM) is fast for reads. But compilers produce massive write I/O to `target/`:
+
+| CARGO_TARGET_DIR location | `cargo check --workspace` (atomic) |
+|---------------------------|-------------------------------------|
+| `/projects/atomic/target` (virtiofs) | **24+ minutes** (timed out) |
+| `/tmp/cargo-target` (VM local disk) | **1m32s** |
+| Host native (no VM) | **~20s** |
+
+The fix: `CARGO_TARGET_DIR=/tmp/cargo-target` in the run step preamble. Also `TMPDIR=/tmp` so test temp files don't go through virtiofs.
+
+This is a hypervisor-level limitation, not something we can architect around. The sealed runner model accounts for it: tools read source from virtiofs (fast), write build artifacts to local disk (fast).
+
+#### 3. VM Persistence: Stop, Don't Delete
+
+The original implementation destroyed the VM after each `cb check`. This meant every run paid the cold compile cost (~1m30s for atomic).
+
+The fix: `smolvm machine stop` instead of `smolvm machine delete`. The VM's overlay disk preserves `/tmp/cargo-target`, so the next run benefits from incremental compilation:
+
+| Run | cargo check --workspace | Total cb check |
+|-----|------------------------|----------------|
+| Cold (first run, empty target) | 1m28s | 2m43s |
+| Warm (VM reused, target cached) | 0.22s | 2.4s |
+
+On next `cb check`, the code detects the existing stopped VM via `smolvm machine ls --json` and starts it instead of creating a new one.
+
+#### 4. Node.js Action Support
+
+`actions-rs/toolchain@v1` is a Node.js action (`runs.using: node12`), not composite. Our resolver now handles this:
+
+1. Detect `runs.using` starts with `node`
+2. Download a standalone Node.js binary (~5s, on-demand, not in baseline)
+3. Download the action tarball from GitHub
+4. Set `INPUT_*` env vars from `with:` inputs
+5. Run `node dist/index.js`
+
+This supports **any** Node.js action — not hardcoded fallbacks.
+
+#### 5. Merged `with:` Inputs Across Jobs
+
+The atomic CI has 6 jobs, 4 of which use `dtolnay/rust-toolchain@stable` with different `with:` inputs:
+
+- `check`: no components
+- `fmt`: `components: rustfmt`
+- `clippy`: `components: clippy`
+- `msrv`: different ref (`@1.87`)
+
+Naive dedup (by `uses` + `with`) ran the action 4 times. The first install succeeded but subsequent ones skipped component installation because the toolchain was already present.
+
+The fix: **merge `with:` inputs** across jobs with the same `uses:` ref. Comma-separated values (like `components`) get unioned:
+
+```
+dtolnay/rust-toolchain@stable → components: "rustfmt,clippy"
+dtolnay/rust-toolchain@1.87   → (separate, different ref)
+```
+
+Result: 2 installs instead of 4. Both `rustfmt` and `clippy` present in the sealed runner.
+
+#### 6. Matrix Job Resolution
+
+The `test` job uses `runs-on: ${{ matrix.os }}` with `matrix.os: [ubuntu-latest, macos-latest, windows-latest]`. Our code now:
+
+1. Detects the `${{ matrix.* }}` expression
+2. Reads `job.strategy.matrix` from the raw YAML
+3. Finds the ubuntu variant
+4. Uses it as the `runs-on` value
+
+Non-ubuntu variants (macos, windows) are skipped — we can only run Linux in a SmolVM.
+
+#### 7. Parallel Exec (Agent Upgrade)
+
+The smolvm guest agent originally serialized all exec calls (single-threaded accept loop). An engineer on the smolvm team (`combined/sqlite-and-fixes` branch) changed it to `std::thread::spawn` per connection.
+
+We cross-compiled the new agent inside a VM using `scripts/rebuild-agent.sh` and verified:
+
+```
+# Before (serial): 3 × 2s sleeps = 6s
+# After (parallel): 3 × 2s sleeps = 2.1s
+```
+
+This enables future parallel job execution within a single VM.
+
+### What `cb check` Is Today
+
+A standalone CLI tool that:
+- Parses GitHub Actions YAML
+- Builds sealed SmolVM runners (cached)
+- Executes `run:` steps inside the VM
+- Reports pass/fail with timing
+- Supports `--from <step>` retry, `--rebuild`, `--json`, `--shell`
+
+What it is **not** yet:
+- Not integrated with circuit-breaker's engine (no NATS, no Petri net, no cb-runner)
+- Not a circuit — just a CLI command that shells out to `smolvm`
+- No overlay snapshots per step
+- No parallel job execution (agent supports it, `cb check` doesn't use it yet)
+
+### What's Next: Integration with Circuit Breaker
+
+The sealed runner model is proven. The next step is wiring it into the circuit-breaker engine so:
+
+1. `cb-runner` uses sealed runners instead of bare `ubuntu:24.04` VMs
+2. The Petri net orchestrates transitions (not sequential exec in a shell script)
+3. Results flow through NATS for real-time monitoring
+4. The agent hook (`cb check`) goes through the full pipeline: cb-api → NATS → cb-controller → cb-runner → smolvm
+5. Parallel job execution uses the new multi-threaded agent

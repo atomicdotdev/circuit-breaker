@@ -91,6 +91,10 @@ interface RawJob {
   needs?: string | string[];
   env?: Record<string, string>;
   name?: string;
+  strategy?: {
+    matrix?: Record<string, unknown>;
+    "fail-fast"?: boolean;
+  };
 }
 
 /** Top-level raw GitHub Actions YAML. */
@@ -965,23 +969,57 @@ export async function check(
             ? runsOn[0]
             : String(runsOn);
 
-      // Skip matrix expressions that resolve to non-ubuntu (macos, windows).
-      // If it's a matrix expression, we can only run the ubuntu variant.
+      // Resolve matrix expressions to the ubuntu variant.
+      // e.g., runs-on: ${{ matrix.os }} with matrix.os: [ubuntu-latest, macos-latest, windows-latest]
+      // → resolve to "ubuntu-latest"
+      let resolvedRunsOn = runsOnStr;
+
       if (runsOnStr.includes("${{") || runsOnStr.includes("matrix")) {
-        console.log(
-          chalk.dim(
-            `  ⊘ ${jobId} — matrix job, skipping (run ubuntu jobs only)`,
-          ),
-        );
-        continue;
+        // Extract the matrix variable name: "${{ matrix.os }}" → "os"
+        const matrixVarMatch = runsOnStr.match(/\$\{\{\s*matrix\.(\w+)\s*\}\}/);
+        const matrixVar = matrixVarMatch?.[1];
+        const matrixValues = matrixVar
+          ? job.strategy?.matrix?.[matrixVar]
+          : undefined;
+
+        if (Array.isArray(matrixValues)) {
+          // Find the ubuntu variant in the matrix values
+          const ubuntuVariant = matrixValues.find(
+            (v: unknown) =>
+              typeof v === "string" && v.toString().includes("ubuntu"),
+          );
+
+          if (ubuntuVariant) {
+            resolvedRunsOn = String(ubuntuVariant);
+            console.log(
+              chalk.dim(
+                `  ℹ ${jobId} — matrix job, using ${resolvedRunsOn} variant`,
+              ),
+            );
+          } else {
+            console.log(
+              chalk.dim(
+                `  ⊘ ${jobId} — matrix job with no ubuntu variant, skipping`,
+              ),
+            );
+            continue;
+          }
+        } else {
+          console.log(
+            chalk.dim(
+              `  ⊘ ${jobId} — unresolvable matrix expression, skipping`,
+            ),
+          );
+          continue;
+        }
       }
 
-      const image = resolveRunsOnImage(runsOnStr);
+      const image = resolveRunsOnImage(resolvedRunsOn);
 
       // Skip non-ubuntu images (macos-latest, windows-latest, etc.)
       if (!image.startsWith("ubuntu")) {
         console.log(
-          chalk.dim(`  ⊘ ${jobId} — ${runsOnStr} (not ubuntu), skipping`),
+          chalk.dim(`  ⊘ ${jobId} — ${resolvedRunsOn} (not ubuntu), skipping`),
         );
         continue;
       }
