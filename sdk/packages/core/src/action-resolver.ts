@@ -48,6 +48,8 @@ interface ActionYml {
     steps?: ActionStep[];
     /** For node/docker actions. */
     main?: string;
+    /** Post-execution script (cleanup). */
+    post?: string;
     image?: string;
   };
 }
@@ -105,23 +107,38 @@ export async function resolveAction(
     return null;
   }
 
-  // Only composite actions are supported
-  if (actionYml.runs.using !== "composite") {
-    if (actionYml.runs.using === "docker") {
-      // Docker action — return the image as a single step
-      const image = actionYml.runs.image;
-      if (image && image.startsWith("docker://")) {
-        return [
-          {
-            id: "docker-action",
-            run: `echo "Docker action image: ${image} (not yet supported)"`,
-            shell: "sh",
-          },
-        ];
-      }
+  // Node.js-based actions — download the action and run with node
+  if (actionYml.runs.using?.startsWith("node")) {
+    const mainFile = actionYml.runs.main;
+    if (!mainFile) {
+      console.warn(`Warning: Node action '${uses}' has no runs.main, skipping`);
+      return null;
+    }
+    return resolveNodeAction(uses, parsed, actionYml, inputs);
+  }
+
+  // Docker-based actions — not yet supported
+  if (actionYml.runs.using === "docker") {
+    const image = actionYml.runs.image;
+    if (image && image.startsWith("docker://")) {
+      return [
+        {
+          id: "docker-action",
+          run: `echo "Docker action image: ${image} (not yet supported)"`,
+          shell: "sh",
+        },
+      ];
     }
     console.warn(
-      `Warning: action '${uses}' uses '${actionYml.runs.using}' (only 'composite' is supported), skipping`,
+      `Warning: Docker action '${uses}' not yet supported, skipping`,
+    );
+    return null;
+  }
+
+  // Unknown action type
+  if (actionYml.runs.using !== "composite") {
+    console.warn(
+      `Warning: action '${uses}' uses '${actionYml.runs.using}' (unsupported), skipping`,
     );
     return null;
   }
@@ -527,6 +544,99 @@ function evaluateSimpleCondition(
   // Simple truthy check: inputs.components → is the value non-empty?
   const value = context[condition];
   return value !== undefined && value !== "" && value !== "false";
+}
+
+// ============ Node.js Action Execution ============
+
+/**
+ * Resolve a Node.js-based GitHub Action by downloading its tarball and
+ * generating a script that runs `node <main>` with the proper INPUT_*
+ * environment variables.
+ *
+ * This supports ANY Node.js action — not just known ones. The action's
+ * bundled dist/index.js runs against the same GITHUB_OUTPUT / GITHUB_ENV /
+ * GITHUB_PATH shim that composite actions use.
+ */
+function resolveNodeAction(
+  uses: string,
+  parsed: UsesRef,
+  actionYml: ActionYml,
+  inputs?: Record<string, unknown>,
+): ResolvedStep[] {
+  const mainFile = actionYml.runs.main!;
+  const postFile = actionYml.runs.post as string | undefined;
+
+  // Resolve inputs: merge provided values with defaults
+  const resolvedInputs = resolveInputs(actionYml, inputs);
+
+  // Build INPUT_* exports
+  const inputExports: string[] = [];
+  for (const [name, value] of Object.entries(resolvedInputs)) {
+    const envKey = `INPUT_${name.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
+    inputExports.push(`export ${envKey}=${shellQuote(value)}`);
+  }
+
+  // The action is downloaded to /tmp/.cb/actions/<owner>/<repo>/<ref>/
+  // and executed with `node <main>`
+  const actionDir = `/tmp/.cb/actions/${parsed.owner}/${parsed.repo}/${parsed.ref}`;
+  const tarballUrl = `https://github.com/${parsed.owner}/${parsed.repo}/archive/${parsed.ref}.tar.gz`;
+
+  // Detect architecture for Node binary download
+  // Node distributes as node-v{ver}-linux-{x64,arm64}.tar.xz
+  const nodeVersion = "20.18.3";
+
+  const script = [
+    `# Node.js action: ${uses}`,
+    `ACTION_DIR="${actionDir}"`,
+    "",
+    "# Install Node.js binary if not already present (standalone, no apt)",
+    `if ! command -v node >/dev/null 2>&1; then`,
+    `  ARCH=$(uname -m)`,
+    `  case "$ARCH" in`,
+    `    x86_64)  NODE_ARCH="x64" ;;`,
+    `    aarch64) NODE_ARCH="arm64" ;;`,
+    `    *)       echo "Unsupported arch: $ARCH"; exit 1 ;;`,
+    `  esac`,
+    `  NODE_URL="https://nodejs.org/dist/v${nodeVersion}/node-v${nodeVersion}-linux-\${NODE_ARCH}.tar.xz"`,
+    `  echo "Installing Node.js v${nodeVersion} (\${NODE_ARCH})..."`,
+    `  curl -sL "$NODE_URL" | tar xJ --strip-components=1 -C /usr/local`,
+    `  echo "Node $(node --version) installed"`,
+    `fi`,
+    "",
+    "# Download action if not already present",
+    `if [ ! -f "$ACTION_DIR/${mainFile}" ]; then`,
+    `  mkdir -p "$ACTION_DIR"`,
+    `  echo "Downloading ${uses}..."`,
+    `  curl -sL "${tarballUrl}" | tar xz --strip-components=1 -C "$ACTION_DIR"`,
+    `fi`,
+    "",
+    "# Set INPUT_* environment variables",
+    ...inputExports,
+    "",
+    "# Run the action",
+    `cd "$ACTION_DIR"`,
+    `node "${mainFile}"`,
+    "",
+    // Some actions have a post step (cleanup). Run it if it exists.
+    ...(postFile
+      ? [
+          `# Post step`,
+          `if [ -f "$ACTION_DIR/${postFile}" ]; then`,
+          `  export STATE_isPost=true`,
+          `  node "${postFile}"`,
+          `fi`,
+        ]
+      : []),
+  ].join("\n");
+
+  return [
+    {
+      id: "node-action",
+      run: script,
+      shell: "bash",
+      name: actionYml.name ?? uses,
+    },
+  ];
 }
 
 /**

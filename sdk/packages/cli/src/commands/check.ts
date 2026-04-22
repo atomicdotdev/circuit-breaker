@@ -450,6 +450,32 @@ async function destroyVM(vmName: string): Promise<void> {
   await smolvm(["machine", "delete", vmName, "-f"]);
 }
 
+async function stopVM(vmName: string): Promise<void> {
+  await smolvm(["machine", "stop", "--name", vmName]);
+}
+
+/**
+ * Get the state of a VM from `smolvm machine ls --json`.
+ *
+ * Returns the machine's state string ("running", "stopped", etc.)
+ * or null if the VM doesn't exist. This is reliable — unlike
+ * `smolvm machine status` which returns exit 0 for non-existent VMs.
+ */
+async function getVmState(
+  vmName: string,
+): Promise<"running" | "stopped" | string | null> {
+  const result = await smolvm(["machine", "ls", "--json"]);
+  if (result.exitCode !== 0) return null;
+
+  try {
+    const machines = JSON.parse(result.stdout);
+    const vm = machines.find((m: { name: string }) => m.name === vmName);
+    return vm?.state ?? null;
+  } catch {
+    return null;
+  }
+}
+
 // ============ Sealed Runner Build ============
 
 /**
@@ -596,19 +622,33 @@ async function buildSealedRunner(
 async function bootSealedRunner(
   cachePath: string,
   source: string,
-): Promise<boolean> {
-  // Clean up any leftover runner VM
-  await destroyVM(RUNNER_VM);
-
-  // Mount the parent directory so sibling path dependencies resolve.
-  // e.g. if source is /Users/lee/Projects/circuit-vm, we mount
-  // /Users/lee/Projects at /projects, and the working directory
-  // becomes /projects/circuit-vm. This way ../smolvm resolves to
-  // /projects/smolvm inside the VM.
+): Promise<{ booted: boolean; reused: boolean }> {
   const absSource = resolve(source);
   const parentDir = dirname(absSource);
-  const projectName = basename(absSource);
 
+  // If the runner VM already exists, just start it.
+  // The overlay disk preserves cargo target, node_modules, etc.
+  const vmState = await getVmState(RUNNER_VM);
+
+  if (vmState === "running") {
+    return { booted: true, reused: true };
+  }
+
+  if (vmState === "stopped") {
+    const start = await smolvm(["machine", "start", "--name", RUNNER_VM]);
+    if (start.exitCode === 0) {
+      return { booted: true, reused: true };
+    }
+
+    // Failed to start existing VM — delete and recreate
+    console.log(
+      chalk.dim("  Existing runner VM failed to start, recreating..."),
+    );
+    await destroyVM(RUNNER_VM);
+  }
+
+  // Create a fresh runner VM from the sealed .smolmachine.
+  // Mount the parent directory so sibling path dependencies resolve.
   const create = await smolvm([
     "machine",
     "create",
@@ -624,7 +664,7 @@ async function bootSealedRunner(
     console.error(
       chalk.red(`  Failed to create runner VM: ${create.stderr.trim()}`),
     );
-    return false;
+    return { booted: false, reused: false };
   }
 
   const start = await smolvm(["machine", "start", "--name", RUNNER_VM]);
@@ -632,10 +672,10 @@ async function bootSealedRunner(
     console.error(
       chalk.red(`  Failed to start runner VM: ${start.stderr.trim()}`),
     );
-    return false;
+    return { booted: false, reused: false };
   }
 
-  return true;
+  return { booted: true, reused: false };
 }
 
 async function execRunStep(
@@ -671,17 +711,92 @@ async function execRunStep(
 
   const fullScript = parts.join("\n");
 
-  const result = await smolvm(
-    ["machine", "exec", "--name", RUNNER_VM, "--", "bash", "-c", fullScript],
-    { timeout: 600_000 },
-  ); // 10 minute timeout per run step
+  // Stream output live so long-running compiles show progress instead
+  // of appearing to hang for minutes with no output.
+  const proc = Bun.spawn(
+    [
+      "smolvm",
+      "machine",
+      "exec",
+      "--name",
+      RUNNER_VM,
+      "--",
+      "bash",
+      "-c",
+      fullScript,
+    ],
+    { stdout: "pipe", stderr: "pipe" },
+  );
+
+  const stdoutChunks: string[] = [];
+  const stderrChunks: string[] = [];
+
+  // 30 minute timeout — large projects (atomic) compile hundreds of crates
+  const TIMEOUT_MS = 1_800_000;
+  let killed = false;
+  const timer = setTimeout(() => {
+    killed = true;
+    proc.kill();
+  }, TIMEOUT_MS);
+
+  const streamLines = async (
+    stream: ReadableStream<Uint8Array>,
+    chunks: string[],
+    prefix: string,
+  ) => {
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const text = decoder.decode(value, { stream: true });
+      chunks.push(text);
+      buffer += text;
+
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        if (line.trim().length > 0) {
+          console.log(chalk.dim(`${prefix}${line}`));
+        }
+      }
+    }
+
+    if (buffer.trim().length > 0) {
+      console.log(chalk.dim(`${prefix}${buffer}`));
+    }
+  };
+
+  await Promise.all([
+    streamLines(
+      proc.stdout as ReadableStream<Uint8Array>,
+      stdoutChunks,
+      "    ",
+    ),
+    streamLines(
+      proc.stderr as ReadableStream<Uint8Array>,
+      stderrChunks,
+      "    ",
+    ),
+  ]);
+
+  const exitCode = await proc.exited;
+  clearTimeout(timer);
 
   const duration_ms = Math.round(performance.now() - start);
 
+  if (killed) {
+    console.log(chalk.red(`    (timed out after ${TIMEOUT_MS / 1000}s)`));
+  }
+
   return {
-    exit_code: result.exitCode,
-    stdout: result.stdout,
-    stderr: result.stderr,
+    exit_code: killed ? 124 : exitCode,
+    stdout: stdoutChunks.join(""),
+    stderr: stderrChunks.join(""),
     duration_ms,
   };
 }
@@ -819,23 +934,95 @@ export async function check(
       continue;
     }
 
-    // For now, process the first job (multi-job support can come later)
-    const [jobId, job] = jobEntries[0];
-    const image = resolveRunsOnImage(job["runs-on"]);
-    const { usesSteps, runSteps } = separateSteps(job.steps);
+    // ── Collect all runnable jobs ────────────────────────────────────
 
-    if (runSteps.length === 0) {
-      console.log(chalk.dim(`  ⊘ ${wfName} — no run: steps, skipping`));
+    // Filter jobs: resolve runs-on, skip matrix non-ubuntu, separate steps.
+    // All ubuntu-based jobs share the same sealed runner VM.
+    const runnableJobs: {
+      jobId: string;
+      image: string;
+      usesSteps: {
+        uses: string;
+        with?: Record<string, unknown>;
+        name?: string;
+        env?: Record<string, string>;
+      }[];
+      runSteps: {
+        id: string;
+        command: string;
+        env?: Record<string, string>;
+        workdir?: string;
+        shell?: string;
+      }[];
+    }[] = [];
+
+    for (const [jobId, job] of jobEntries) {
+      const runsOn = job["runs-on"];
+      const runsOnStr =
+        typeof runsOn === "string"
+          ? runsOn
+          : Array.isArray(runsOn)
+            ? runsOn[0]
+            : String(runsOn);
+
+      // Skip matrix expressions that resolve to non-ubuntu (macos, windows).
+      // If it's a matrix expression, we can only run the ubuntu variant.
+      if (runsOnStr.includes("${{") || runsOnStr.includes("matrix")) {
+        console.log(
+          chalk.dim(
+            `  ⊘ ${jobId} — matrix job, skipping (run ubuntu jobs only)`,
+          ),
+        );
+        continue;
+      }
+
+      const image = resolveRunsOnImage(runsOnStr);
+
+      // Skip non-ubuntu images (macos-latest, windows-latest, etc.)
+      if (!image.startsWith("ubuntu")) {
+        console.log(
+          chalk.dim(`  ⊘ ${jobId} — ${runsOnStr} (not ubuntu), skipping`),
+        );
+        continue;
+      }
+
+      const { usesSteps, runSteps } = separateSteps(job.steps);
+
+      if (runSteps.length === 0) {
+        console.log(chalk.dim(`  ⊘ ${jobId} — no run: steps, skipping`));
+        continue;
+      }
+
+      // Prefix step IDs with job name to avoid collisions across jobs
+      const prefixedRunSteps = runSteps.map((s) => ({
+        ...s,
+        id: `${jobId}/${s.id}`,
+      }));
+
+      runnableJobs.push({
+        jobId,
+        image,
+        usesSteps,
+        runSteps: prefixedRunSteps,
+      });
+    }
+
+    if (runnableJobs.length === 0) {
+      console.log(chalk.dim(`  ⊘ ${wfName} — no runnable jobs, skipping`));
       continue;
     }
 
-    console.log(chalk.dim(`  Job: ${jobId} (${image})`));
+    // Summary
+    const totalRunSteps = runnableJobs.reduce(
+      (n, j) => n + j.runSteps.length,
+      0,
+    );
     console.log(
-      chalk.dim(`  Setup: ${usesSteps.length} uses: step(s) → sealed runner`),
+      chalk.dim(`  Jobs: ${runnableJobs.map((j) => j.jobId).join(", ")}`),
     );
     console.log(
       chalk.dim(
-        `  Run:   ${runSteps.length} run: step(s) → Petri net transitions`,
+        `  Run:  ${totalRunSteps} step(s) across ${runnableJobs.length} job(s)`,
       ),
     );
 
@@ -843,14 +1030,13 @@ export async function check(
 
     if (useShell) {
       const steps: StepResult[] = [];
-      let skipRemaining = false;
-      let fromReached = !options.from;
 
-      for (const cmd of runSteps) {
-        if (!fromReached) {
-          if (cmd.id === options.from) {
-            fromReached = true;
-          } else {
+      for (const job of runnableJobs) {
+        console.log(chalk.bold(`  ▸ ${job.jobId}`));
+        let skipRemaining = false;
+
+        for (const cmd of job.runSteps) {
+          if (skipRemaining) {
             steps.push({
               id: cmd.id,
               status: "skipped",
@@ -859,52 +1045,39 @@ export async function check(
               output: "",
               error: "",
             });
-            console.log(chalk.dim(`  ⊘ ${cmd.id} (skipped — before --from)`));
+            console.log(chalk.dim(`    ⊘ ${cmd.id} (skipped)`));
             continue;
           }
-        }
 
-        if (skipRemaining) {
+          process.stdout.write(chalk.blue(`    ▶ ${cmd.id}...`));
+          const result = await execLocally(cmd.command, source);
+          const passed = result.exit_code === 0;
+
           steps.push({
             id: cmd.id,
-            status: "skipped",
-            duration_ms: 0,
-            exit_code: 0,
-            output: "",
-            error: "",
+            status: passed ? "passed" : "failed",
+            duration_ms: result.duration_ms,
+            exit_code: result.exit_code,
+            output: result.stdout,
+            error: result.stderr,
           });
-          console.log(chalk.dim(`  ⊘ ${cmd.id} (skipped)`));
-          continue;
-        }
 
-        process.stdout.write(chalk.blue(`  ▶ ${cmd.id}...`));
-        const result = await execLocally(cmd.command, source);
-        const passed = result.exit_code === 0;
-
-        steps.push({
-          id: cmd.id,
-          status: passed ? "passed" : "failed",
-          duration_ms: result.duration_ms,
-          exit_code: result.exit_code,
-          output: result.stdout,
-          error: result.stderr,
-        });
-
-        if (passed) {
-          console.log(
-            `\r  ${chalk.green("✓")} ${cmd.id} ${chalk.dim(`(${result.duration_ms}ms)`)}`,
-          );
-        } else {
-          console.log(
-            `\r  ${chalk.red("✗")} ${cmd.id} ${chalk.dim(`(${result.duration_ms}ms)`)}`,
-          );
-          const errorOutput = (result.stderr || result.stdout).trim();
-          if (errorOutput) {
-            for (const line of errorOutput.split("\n").slice(-10)) {
-              console.log(chalk.red(`    ${line}`));
+          if (passed) {
+            console.log(
+              `\r    ${chalk.green("✓")} ${cmd.id} ${chalk.dim(`(${result.duration_ms}ms)`)}`,
+            );
+          } else {
+            console.log(
+              `\r    ${chalk.red("✗")} ${cmd.id} ${chalk.dim(`(${result.duration_ms}ms)`)}`,
+            );
+            const errorOutput = (result.stderr || result.stdout).trim();
+            if (errorOutput) {
+              for (const line of errorOutput.split("\n").slice(-10)) {
+                console.log(chalk.red(`      ${line}`));
+              }
             }
+            skipRemaining = true;
           }
-          skipRemaining = true;
         }
       }
 
@@ -916,7 +1089,7 @@ export async function check(
 
       allResults.push({
         workflow: wfName,
-        image,
+        image: runnableJobs[0].image,
         runner_cache_key: "shell",
         status: wfPassed ? "passed" : "failed",
         steps,
@@ -942,8 +1115,87 @@ export async function check(
 
     // ── Sealed runner mode ─────────────────────────────────────────
 
-    // Compute cache key from image + uses: steps
-    const usesForCache = usesSteps.map((s) => ({ uses: s.uses, with: s.with }));
+    // Collect ALL uses: steps across all jobs for the sealed runner.
+    // The runner gets every tool from every job baked in.
+    //
+    // Merge strategy: when the same action appears multiple times with
+    // different `with:` inputs (e.g., dtolnay/rust-toolchain@stable used
+    // by check with no components, fmt with components: rustfmt, and
+    // clippy with components: clippy), we merge the inputs into a single
+    // invocation. Comma-separated values (like components, targets) get
+    // unioned. Other values use last-writer-wins.
+    const allUsesSteps = runnableJobs.flatMap((j) => j.usesSteps);
+
+    const mergedUsesMap = new Map<
+      string,
+      {
+        uses: string;
+        with?: Record<string, unknown>;
+        name?: string;
+        env?: Record<string, string>;
+      }
+    >();
+
+    for (const step of allUsesSteps) {
+      const existing = mergedUsesMap.get(step.uses);
+      if (!existing) {
+        // First occurrence — clone it
+        mergedUsesMap.set(step.uses, {
+          uses: step.uses,
+          with: step.with ? { ...step.with } : undefined,
+          name: step.name,
+          env: step.env ? { ...step.env } : undefined,
+        });
+      } else {
+        // Merge with: inputs into the existing entry
+        if (step.with) {
+          if (!existing.with) existing.with = {};
+          for (const [key, value] of Object.entries(step.with)) {
+            const prev = existing.with[key];
+            if (prev === undefined || prev === "") {
+              // New key or empty previous — take the new value
+              existing.with[key] = value;
+            } else if (
+              typeof prev === "string" &&
+              typeof value === "string" &&
+              value !== ""
+            ) {
+              // Both are non-empty strings — union comma-separated values.
+              // This handles `components: "rustfmt"` + `components: "clippy"`
+              // → `components: "rustfmt,clippy"`
+              const prevSet = new Set(
+                prev
+                  .split(",")
+                  .map((s: string) => s.trim())
+                  .filter(Boolean),
+              );
+              const newSet = value
+                .split(",")
+                .map((s: string) => s.trim())
+                .filter(Boolean);
+              for (const v of newSet) {
+                prevSet.add(v);
+              }
+              existing.with[key] = [...prevSet].join(",");
+            }
+            // For non-string values, last-writer-wins (first value kept)
+          }
+        }
+        // Merge env
+        if (step.env) {
+          if (!existing.env) existing.env = {};
+          Object.assign(existing.env, step.env);
+        }
+      }
+    }
+
+    const dedupedUses = [...mergedUsesMap.values()];
+
+    const image = runnableJobs[0].image;
+    const usesForCache = dedupedUses.map((s) => ({
+      uses: s.uses,
+      with: s.with,
+    }));
     const cacheKey = runnerCacheKey(image, usesForCache);
     const cachePath = runnerCachePath(cacheKey);
     let runnerBuilt = false;
@@ -954,7 +1206,7 @@ export async function check(
     if (options.rebuild || !existsSync(cachePath)) {
       if (options.rebuild && existsSync(cachePath)) {
         console.log(chalk.dim("  --rebuild: ignoring cached runner"));
-      } else if (usesSteps.length === 0) {
+      } else if (dedupedUses.length === 0) {
         console.log(chalk.dim("  No uses: steps — building baseline runner"));
       } else {
         console.log(chalk.dim("  Cache miss — building sealed runner"));
@@ -962,7 +1214,7 @@ export async function check(
 
       const built = await buildSealedRunner(
         image,
-        usesSteps,
+        dedupedUses,
         cacheKey,
         cachePath,
       );
@@ -975,10 +1227,10 @@ export async function check(
       console.log(chalk.green("  ✓ Using cached runner"));
     }
 
-    // Boot the sealed runner with source mounted
+    // Boot the sealed runner with source mounted (or reuse existing)
     console.log(chalk.dim("  Booting sealed runner..."));
     const bootStart = performance.now();
-    const booted = await bootSealedRunner(cachePath, source);
+    const { booted, reused } = await bootSealedRunner(cachePath, source);
     const bootDuration = Math.round(performance.now() - bootStart);
 
     if (!booted) {
@@ -992,23 +1244,45 @@ export async function check(
     const projectWorkdir = `/projects/${projectName}`;
 
     console.log(
-      chalk.green(`  ✓ Runner ready ${chalk.dim(`(${bootDuration}ms)`)}`),
+      chalk.green(
+        `  ✓ Runner ${reused ? "reused" : "ready"} ${chalk.dim(`(${bootDuration}ms)`)}`,
+      ),
     );
     console.log(chalk.dim(`  Working directory: ${projectWorkdir}`));
     console.log();
 
-    // Execute run: steps
+    // Execute run: steps for all jobs sequentially, sharing the same VM
     const steps: StepResult[] = [];
-    let skipRemaining = false;
-    let fromReached = !options.from;
+    let workflowFailed = false;
 
     try {
-      for (const cmd of runSteps) {
-        // Handle --from: skip until we reach the specified step
-        if (!fromReached) {
-          if (cmd.id === options.from) {
-            fromReached = true;
-          } else {
+      for (const job of runnableJobs) {
+        console.log(chalk.bold(`  ▸ ${job.jobId}`));
+        let skipRemaining = false;
+        let fromReached = !options.from;
+
+        for (const cmd of job.runSteps) {
+          // Handle --from: skip until we reach the specified step
+          if (!fromReached) {
+            if (cmd.id === options.from) {
+              fromReached = true;
+            } else {
+              steps.push({
+                id: cmd.id,
+                status: "skipped",
+                duration_ms: 0,
+                exit_code: 0,
+                output: "",
+                error: "",
+              });
+              console.log(
+                chalk.dim(`    ⊘ ${cmd.id} (skipped — before --from)`),
+              );
+              continue;
+            }
+          }
+
+          if (skipRemaining) {
             steps.push({
               id: cmd.id,
               status: "skipped",
@@ -1017,78 +1291,71 @@ export async function check(
               output: "",
               error: "",
             });
-            console.log(chalk.dim(`  ⊘ ${cmd.id} (skipped — before --from)`));
+            console.log(chalk.dim(`    ⊘ ${cmd.id} (skipped)`));
             continue;
           }
-        }
 
-        if (skipRemaining) {
+          // Execute the step
+          process.stdout.write(chalk.blue(`    ▶ ${cmd.id}...`));
+
+          const result = await execRunStep(
+            cmd.command,
+            projectWorkdir,
+            cmd.env,
+            cmd.workdir,
+          );
+          const passed = result.exit_code === 0;
+
           steps.push({
             id: cmd.id,
-            status: "skipped",
-            duration_ms: 0,
-            exit_code: 0,
-            output: "",
-            error: "",
+            status: passed ? "passed" : "failed",
+            duration_ms: result.duration_ms,
+            exit_code: result.exit_code,
+            output: result.stdout,
+            error: result.stderr,
           });
-          console.log(chalk.dim(`  ⊘ ${cmd.id} (skipped)`));
-          continue;
-        }
 
-        // Execute the step
-        process.stdout.write(chalk.blue(`  ▶ ${cmd.id}...`));
+          if (passed) {
+            console.log(
+              `\r    ${chalk.green("✓")} ${cmd.id} ${chalk.dim(`(${result.duration_ms}ms)`)}`,
+            );
+          } else {
+            console.log(
+              `\r    ${chalk.red("✗")} ${cmd.id} ${chalk.dim(`(${result.duration_ms}ms)`)}`,
+            );
 
-        const result = await execRunStep(
-          cmd.command,
-          projectWorkdir,
-          cmd.env,
-          cmd.workdir,
-        );
-        const passed = result.exit_code === 0;
-
-        steps.push({
-          id: cmd.id,
-          status: passed ? "passed" : "failed",
-          duration_ms: result.duration_ms,
-          exit_code: result.exit_code,
-          output: result.stdout,
-          error: result.stderr,
-        });
-
-        if (passed) {
-          console.log(
-            `\r  ${chalk.green("✓")} ${cmd.id} ${chalk.dim(`(${result.duration_ms}ms)`)}`,
-          );
-        } else {
-          console.log(
-            `\r  ${chalk.red("✗")} ${cmd.id} ${chalk.dim(`(${result.duration_ms}ms)`)}`,
-          );
-
-          // Show last 10 lines of error output
-          const errorOutput = (result.stderr || result.stdout).trim();
-          if (errorOutput) {
-            const lines = errorOutput.split("\n").slice(-10);
-            for (const line of lines) {
-              console.log(chalk.red(`    ${line}`));
+            // Show last 10 lines of error output
+            const errorOutput = (result.stderr || result.stdout).trim();
+            if (errorOutput) {
+              const lines = errorOutput.split("\n").slice(-10);
+              for (const line of lines) {
+                console.log(chalk.red(`      ${line}`));
+              }
             }
-          }
 
-          skipRemaining = true;
+            skipRemaining = true;
+            workflowFailed = true;
+          }
         }
       }
     } finally {
-      // Always clean up the runner VM
-      await destroyVM(RUNNER_VM);
+      // Stop the VM but keep it — overlay preserves build artifacts
+      // (cargo target, node_modules, etc.) for the next run.
+      await stopVM(RUNNER_VM);
     }
 
-    if (!fromReached && options.from) {
-      console.error(
-        chalk.red(`\n✗ Step '${options.from}' not found in ${wfName}`),
+    if (!workflowFailed && options.from) {
+      // Check if --from matched anything
+      const allStepIds = runnableJobs.flatMap((j) =>
+        j.runSteps.map((s) => s.id),
       );
-      console.error(
-        chalk.dim(`  Available steps: ${runSteps.map((c) => c.id).join(", ")}`),
-      );
-      process.exit(1);
+      if (!allStepIds.includes(options.from ?? "")) {
+        console.error(
+          chalk.red(`\n✗ Step '${options.from}' not found in ${wfName}`),
+        );
+        console.error(chalk.dim(`  Available steps: ${allStepIds.join(", ")}`));
+        process.exit(1);
+      }
     }
 
     const wfPassed = steps.every(

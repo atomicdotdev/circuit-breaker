@@ -272,6 +272,12 @@ if [ -f /tmp/.cb/github_path ]; then
     [ -n "$_line" ] && export PATH="$_line:$PATH"
   done < /tmp/.cb/github_path
 fi
+
+# Use the VM's local disk for build artifacts — virtiofs mounts are
+# fast for reads but very slow for the heavy write I/O that compilers
+# produce (cargo writes thousands of files to target/).
+export CARGO_TARGET_DIR=/tmp/cargo-target
+mkdir -p /tmp/cargo-target
 `.trim();
 
 // ============ Cache Key ============
