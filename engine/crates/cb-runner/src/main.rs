@@ -89,6 +89,38 @@ struct TaskResources {
 }
 
 /// Runner state
+/// Check known locations for a sealed .smolmachine file.
+/// Returns the full path if found, None if not (treat as OCI image).
+fn resolve_smolmachine(name: &str) -> Option<String> {
+    let smolmachine = format!("{}.smolmachine", name);
+
+    let mut candidates: Vec<std::path::PathBuf> = vec![
+        // /tmp/<name>.smolmachine (dev/demo)
+        std::path::PathBuf::from("/tmp").join(&smolmachine),
+        // Current directory
+        std::path::PathBuf::from(&smolmachine),
+    ];
+
+    // ~/.cb/machines/<name>.smolmachine
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.insert(
+            0,
+            std::path::PathBuf::from(home)
+                .join(".cb")
+                .join("machines")
+                .join(&smolmachine),
+        );
+    }
+
+    for candidate in &candidates {
+        if candidate.exists() {
+            return Some(candidate.display().to_string());
+        }
+    }
+
+    None
+}
+
 struct Runner {
     runner_id: String,
     pool: String,
@@ -217,12 +249,16 @@ impl Runner {
         env: &HashMap<String, String>,
         transition_ref: &TransitionRef,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-        let image = action.image.as_deref().unwrap_or("ubuntu:24.04");
+        let image_name = action.image.as_deref().unwrap_or("ubuntu:24.04");
+
+        // Check if this is a sealed .smolmachine (look in ~/.cb/machines/ and /tmp/)
+        let smolmachine_path = resolve_smolmachine(image_name);
         let vm_name = format!("cb-run-{}", &transition_ref.run_id.to_string()[..8]);
 
         info!(
             vm_name = %vm_name,
-            image = %image,
+            image = %image_name,
+            machine = ?smolmachine_path,
             command = %action.command,
             "Executing circuit action"
         );
@@ -237,23 +273,28 @@ impl Runner {
         let is_running = ls_text.contains(&vm_name) && ls_text.contains("running");
 
         if !is_running {
-            info!(vm_name = %vm_name, image = %image, "Creating circuit VM");
+            info!(vm_name = %vm_name, image = %image_name, machine = ?smolmachine_path, "Creating circuit VM");
 
             let source_dir = std::env::current_dir()?.display().to_string();
 
-            let create_output = Command::new("circuit")
-                .args([
-                    "machine",
-                    "create",
-                    "--image",
-                    image,
-                    "--net",
-                    "--volume",
-                    &format!("{}:/projects", source_dir),
-                    &vm_name,
-                ])
-                .output()
-                .await?;
+            let mut create_args = vec!["machine".to_string(), "create".to_string()];
+
+            if let Some(ref pack_path) = smolmachine_path {
+                create_args.push("--from".to_string());
+                create_args.push(pack_path.clone());
+            } else {
+                create_args.push("--image".to_string());
+                create_args.push(image_name.to_string());
+            }
+
+            create_args.extend([
+                "--net".to_string(),
+                "--volume".to_string(),
+                format!("{}:/projects", source_dir),
+                vm_name.clone(),
+            ]);
+
+            let create_output = Command::new("circuit").args(&create_args).output().await?;
 
             if !create_output.status.success() {
                 let stderr = String::from_utf8_lossy(&create_output.stderr);
@@ -310,7 +351,7 @@ impl Runner {
         let log_payload = serde_json::json!({
             "transitionRef": transition_ref,
             "command": action.command,
-            "image": image,
+            "image": image_name,
             "stdout": &stdout[..stdout.len().min(10000)],
             "stderr": &stderr[..stderr.len().min(10000)],
             "exitCode": output.status.code(),
