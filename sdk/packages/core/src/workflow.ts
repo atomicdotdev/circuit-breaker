@@ -234,6 +234,40 @@ export class WorkflowBuilder {
   }
 
   /**
+   * Begin a parallel fanout/join pattern.
+   *
+   * Runs all `steps` concurrently, each starting from `fromPlace`, then
+   * waits for every branch to complete before producing a token in the
+   * convergence place named by `.join()`.
+   *
+   * Under the hood this generates hidden `fanout-fork-*` and `fanout-join-*`
+   * transitions that pass all accumulated token data through so downstream
+   * steps always have the full context.
+   *
+   * @param fromPlace - Place that triggers the fanout (must already be defined)
+   * @param steps - Each step is a callback that configures a TransitionBuilder.
+   *                Do **not** call `.done()` inside the callback — the
+   *                FanoutBuilder finalises each transition when `.join()` is called.
+   *
+   * @example
+   * ```ts
+   * .fanout("triage-complete", [
+   *   w => w.transition("gather-metrics").script(`...`),
+   *   w => w.transition("gather-logs").script(`...`),
+   *   w => w.transition("check-deploys").script(`...`),
+   * ])
+   * .join("all-evidence-ready")
+   * ```
+   */
+  fanout(
+    fromPlace: string,
+    steps: Array<(wf: WorkflowBuilder) => TransitionBuilder>,
+  ): FanoutBuilder {
+    const builders = steps.map((fn) => fn(this));
+    return new FanoutBuilder(this, fromPlace, builders);
+  }
+
+  /**
    * Internal method to add a completed transition.
    * @internal
    */
@@ -776,6 +810,86 @@ export class TransitionBuilder {
     }
 
     this.parent._addTransition(this._transition as Transition);
+    return this.parent;
+  }
+}
+
+/**
+ * Fluent builder for the parallel fanout/join pattern.
+ *
+ * Created by {@link WorkflowBuilder.fanout}. Call `.join(toPlace)` to
+ * materialise the AND-split → parallel steps → AND-join wiring into the
+ * parent workflow.
+ *
+ * The hidden fork and join transitions both run `return ctx` so that all
+ * accumulated token data flows through to the next step.
+ */
+export class FanoutBuilder {
+  constructor(
+    private parent: WorkflowBuilder,
+    private fromPlace: string,
+    private stepBuilders: TransitionBuilder[],
+  ) {}
+
+  /**
+   * Complete the fanout by naming the convergence place.
+   *
+   * Generated wiring (all prefixed with `fanout-`):
+   * - `fanout-{step}-in` / `fanout-{step}-out` places for each step
+   * - `fanout-fork-{fromPlace}` script transition: fromPlace → all `-in` places (AND-split)
+   * - Each step transition wired from its `-in` to its `-out` place
+   * - `toPlace` added as a new place
+   * - `fanout-join-{toPlace}` script transition: all `-out` places → toPlace (AND-join)
+   *
+   * Both generated transitions run `return ctx` to pass all merged token
+   * data through to downstream steps.
+   *
+   * @param toPlace - Convergence place name (created automatically)
+   * @returns The parent WorkflowBuilder so you can continue the chain
+   */
+  join(toPlace: string): WorkflowBuilder {
+    const stepIds = this.stepBuilders.map(
+      (b) => (b as any)._transition.id as string,
+    );
+    const inPlaces = stepIds.map((id) => `fanout-${id}-in`);
+    const outPlaces = stepIds.map((id) => `fanout-${id}-out`);
+
+    // Intermediate places (hidden plumbing)
+    for (const p of [...inPlaces, ...outPlaces]) {
+      this.parent.place(p, {});
+    }
+
+    // Fork: fromPlace → all step input places (AND-split), data passes through.
+    this.parent
+      .transition(`fanout-fork-${this.fromPlace}`)
+      .from(this.fromPlace)
+      .to(...inPlaces)
+      .script("return ctx")
+      .done();
+
+    // Wire each step with generated input/output places
+    for (let i = 0; i < this.stepBuilders.length; i++) {
+      const t = (this.stepBuilders[i] as any)._transition;
+      if (!t.action) {
+        throw new Error(
+          `Fanout step '${t.id}' must have an action configured. ` +
+            "Call .script(), .dagger(), .http(), or .noop() in the callback before .join().",
+        );
+      }
+      t.inputs = [{ place: inPlaces[i]!, weight: 1 }];
+      t.outputs = [{ place: outPlaces[i]!, weight: 1 }];
+      this.parent._addTransition(t);
+    }
+
+    // Convergence place + join transition (AND-join), merged data passes through.
+    this.parent.place(toPlace, {});
+    this.parent
+      .transition(`fanout-join-${toPlace}`)
+      .from(...outPlaces)
+      .to(toPlace)
+      .script("return ctx")
+      .done();
+
     return this.parent;
   }
 }
