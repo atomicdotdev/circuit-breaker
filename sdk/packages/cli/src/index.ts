@@ -18,11 +18,13 @@ import {
   visualize as generateVisualization,
   getGraphvizUrl,
   getMermaidUrl,
+  fromGitHubActionsFile,
   type Workflow,
 } from "@circuit-breaker/core";
 import logs from "./commands/logs";
 import inject from "./commands/inject";
 import describe from "./commands/describe";
+import { registerCheckCommand } from "./commands/check";
 import { startTUI } from "./tui";
 
 const VERSION = "0.1.0";
@@ -56,7 +58,14 @@ async function loadWorkflow(filePath: string): Promise<Workflow> {
     return WorkflowSchema.parse(workflow);
   }
 
-  throw new Error(`Unsupported file extension: ${ext}. Use .ts, .js, or .json`);
+  if (ext === ".yml" || ext === ".yaml") {
+    const result = await fromGitHubActionsFile(absolutePath);
+    return result.workflow;
+  }
+
+  throw new Error(
+    `Unsupported file extension: ${ext}. Use .ts, .js, .json, .yml, or .yaml`,
+  );
 }
 
 // ============ Commands ============
@@ -574,6 +583,9 @@ program
       });
     },
   );
+
+// Check command — run GitHub Actions locally
+registerCheckCommand(program);
 
 // Health command
 program

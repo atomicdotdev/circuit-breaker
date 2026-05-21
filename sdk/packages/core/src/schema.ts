@@ -174,6 +174,16 @@ export const ScriptActionSchema = z.object({
 
 export type ScriptAction = z.infer<typeof ScriptActionSchema>;
 
+export const CircuitActionSchema = z.object({
+  type: z.literal("circuit"),
+  command: z.string(),
+  image: z.string().optional(),
+  shell: z.string().default("sh"),
+  workdir: z.string().default("/workspace"),
+});
+
+export type CircuitAction = z.infer<typeof CircuitActionSchema>;
+
 export const NoopActionSchema = z.object({
   type: z.literal("noop"),
 });
@@ -184,6 +194,7 @@ export const ActionSchema = z.discriminatedUnion("type", [
   DaggerActionSchema,
   HttpActionSchema,
   ScriptActionSchema,
+  CircuitActionSchema,
   NoopActionSchema,
 ]);
 

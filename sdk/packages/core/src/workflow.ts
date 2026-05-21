@@ -108,6 +108,7 @@ export class WorkflowBuilder {
     namespace: string;
     metadata?: Metadata;
     engine?: EngineConfig;
+    machine?: string;
     places: Place[];
     transitions: Transition[];
   };
@@ -120,6 +121,20 @@ export class WorkflowBuilder {
       places: [],
       transitions: [],
     };
+  }
+
+  /**
+   * Set the sealed SmolVM (.smolmachine) that this workflow runs inside.
+   *
+   * All transitions in this workflow execute inside this VM. The machine
+   * must be pre-built and available at ~/.cb/machines/<name>.smolmachine
+   * or registered by the runner.
+   *
+   * @param name - Name of the sealed .smolmachine (e.g., "cb-quality-v2")
+   */
+  machine(name: string): this {
+    this._workflow.machine = name;
+    return this;
   }
 
   /**
@@ -496,6 +511,26 @@ export class TransitionBuilder {
   }
 
   /**
+   * Configure the transition to run a shell command inside a SmolVM.
+   *
+   * @param command - Shell command to execute inside the VM
+   * @param options - Optional image, shell, and workdir overrides
+   */
+  circuit(
+    command: string,
+    options?: { image?: string; shell?: string; workdir?: string },
+  ): this {
+    this._transition.action = {
+      type: "circuit" as any,
+      command,
+      image: options?.image,
+      shell: options?.shell ?? "sh",
+      workdir: options?.workdir ?? "/workspace",
+    };
+    return this;
+  }
+
+  /**
    * Configure as a no-op transition (for synchronization points like fan-in joins).
    */
   noop(): this {
@@ -771,8 +806,19 @@ export class TransitionBuilder {
     if (!this._transition.action) {
       throw new Error(
         `Transition '${this._transition.id}' must have an action. ` +
-          "Use .dagger(), .http(), .script(), or .noop()",
+          "Use .dagger(), .http(), .script(), .circuit(), or .noop()",
       );
+    }
+
+    // Inherit workflow-level machine into circuit actions that don't specify their own image
+    const wfMachine = (this.parent as any)._workflow.machine;
+    if (
+      wfMachine &&
+      this._transition.action &&
+      (this._transition.action as any).type === "circuit" &&
+      !(this._transition.action as any).image
+    ) {
+      (this._transition.action as any).image = wfMachine;
     }
 
     this.parent._addTransition(this._transition as Transition);
