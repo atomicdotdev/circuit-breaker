@@ -20,12 +20,15 @@
 
 import type { Command } from "commander";
 import chalk from "chalk";
-import { resolve, basename, dirname } from "path";
-import { existsSync, readdirSync, mkdirSync } from "fs";
+import { resolve, basename, dirname, join } from "path";
+import { existsSync, readdirSync, mkdirSync, readFileSync } from "fs";
 import { parse as parseYAML } from "yaml";
+import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import {
   fromGitHubActionsFile,
   validateWorkflow,
+  WorkflowSchema,
   resolveAction,
   BASELINE_INSTALL_STEPS,
   GITHUB_ACTIONS_SHIM,
@@ -37,16 +40,25 @@ import {
   type GitHubActionsWorkflow,
   type ResolvedStep,
 } from "@circuit-breaker/core";
+import { hashFile, hashString, hashDirectory, hashConcat, canonicalJSON } from "../lib/hashing";
+import { openOrCreateGraph, findGraphPath, type RunPayload, type TransitionPayload, type RunStatus } from "../lib/graph";
+import { signWithMachineKey, getMachinePubkeyBase64, machineKeyExists, generateMachineKey } from "../lib/signing";
+import { runCircuit } from "../lib/local-runner";
+import { verifySeal } from "./seal";
+import { loadConfig } from "../lib/config";
+import { s } from "../lib/symbols";
 
 // ============ Types ============
 
 interface CheckOptions {
   workflow?: string;
+  circuit?: string;        // specific native circuit path
   from?: string;
   json?: boolean;
   source?: string;
   shell?: boolean;
   rebuild?: boolean;
+  githubActions?: boolean; // force GitHub Actions bridge mode
 }
 
 interface StepResult {
@@ -312,14 +324,14 @@ async function execInBuilder(
   const start = performance.now();
 
   if (label) {
-    console.log(chalk.dim(`    ▶ ${label}`));
+    console.log(chalk.dim(`    ${s.play} ${label}`));
   }
 
   // Stream output live so the user can see what's happening during
   // long installs (apt-get, rustup, etc.) instead of staring at a
   // frozen terminal for minutes.
   const proc = Bun.spawn(
-    ["smolvm", "machine", "exec", "--name", vmName, "--", "bash", "-c", script],
+    ["smolvm", "machine", "exec", "--name", vmName, "--stream", "--", "bash", "-c", script],
     { stdout: "pipe", stderr: "pipe" },
   );
 
@@ -393,15 +405,15 @@ async function execInBuilder(
   if (label) {
     if (killed) {
       console.log(
-        chalk.red(`    ✗ ${label} (timed out after ${TIMEOUT_MS / 1000}s)`),
+        chalk.red(`    ${s.cross} ${label} (timed out after ${TIMEOUT_MS / 1000}s)`),
       );
     } else if (exitCode === 0) {
       console.log(
-        `    ${chalk.green("✓")} ${label} ${chalk.dim(`(${duration_ms}ms)`)}`,
+        `    ${chalk.green(s.check)} ${label} ${chalk.dim(`(${fmtDuration(duration_ms)})`)}`,
       );
     } else {
       console.log(
-        `    ${chalk.red("✗")} ${label} (exit code ${exitCode}) ${chalk.dim(`(${duration_ms}ms)`)}`,
+        `    ${chalk.red(s.cross)} ${label} (exit code ${exitCode}) ${chalk.dim(`(${fmtDuration(duration_ms)})`)}`,
       );
     }
   }
@@ -553,7 +565,7 @@ async function buildSealedRunner(
 
       const resolved = await resolveAction(step.uses, step.with);
       if (!resolved || resolved.length === 0) {
-        console.log(chalk.dim(`    ⊘ ${label} (no install steps)`));
+        console.log(chalk.dim(`    ${s.skip} ${label} (no install steps)`));
         continue;
       }
 
@@ -611,7 +623,7 @@ async function buildSealedRunner(
     }
 
     console.log(
-      chalk.green(`    ✓ Runner sealed ${chalk.dim(`(${sealDuration}ms)`)}`),
+      chalk.green(`    ${s.check} Runner sealed ${chalk.dim(`(${fmtDuration(sealDuration)})`)}`),
     );
     console.log(chalk.dim(`    Cached at: ${cachePath}`));
     return true;
@@ -724,6 +736,7 @@ async function execRunStep(
       "exec",
       "--name",
       RUNNER_VM,
+      "--stream",
       "--",
       "bash",
       "-c",
@@ -835,6 +848,14 @@ async function execLocally(
 
 // ============ Helpers ============
 
+function fmtDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  const m = Math.floor(ms / 60_000);
+  const s = Math.round((ms % 60_000) / 1000);
+  return s === 0 ? `${m}m` : `${m}m${s}s`;
+}
+
 function slugify(s: string): string {
   return (
     s
@@ -851,6 +872,474 @@ function shellQuote(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
+// ============ Circuit File Loader ============
+
+/** Spawn a subprocess rooted at cbRoot to load a circuit file as a Workflow object.
+ *  Running via subprocess ensures `@circuit-breaker/core` resolves from the
+ *  project's own node_modules, not the circuit file's directory. */
+async function loadCircuitWorkflow(circuitPath: string, cbRoot: string): Promise<Workflow> {
+  const { fileURLToPath } = await import("node:url");
+  const { existsSync: _exists } = await import("node:fs");
+  const thisFile = fileURLToPath(import.meta.url);
+  // When running from source (src/commands/check.ts), go up two dirs to reach src/lib/.
+  // When running from built dist (dist/index.js), go up one dir to reach dist/lib/.
+  // Try .js first (built), then .ts (source/dev).
+  const candidates = [
+    resolve(thisFile, "../lib/circuit-loader.js"),     // dist/lib/
+    resolve(thisFile, "../../lib/circuit-loader.ts"),  // src/lib/
+    resolve(thisFile, "../../lib/circuit-loader.js"),  // src/lib/ (built)
+  ];
+  const loaderPath = candidates.find(_exists) ?? candidates[0]!;
+
+  // Add the CLI's own node_modules to NODE_PATH so @circuit-breaker/core
+  // resolves even when the circuit lives in a project that doesn't have it installed.
+  const cliNodeModules = resolve(thisFile, "../../node_modules");
+  const existingNodePath = process.env.NODE_PATH ?? "";
+  const nodePath = existingNodePath ? `${cliNodeModules}:${existingNodePath}` : cliNodeModules;
+
+  const proc = Bun.spawn(["bun", loaderPath, circuitPath], {
+    cwd: cbRoot,
+    stdout: "pipe",
+    stderr: "pipe",
+    env: { ...process.env, NODE_PATH: nodePath },
+  });
+
+  const [stdout, stderr] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  const exit = await proc.exited;
+
+  if (exit !== 0) {
+    throw new Error(stderr.trim() || "Failed to load circuit");
+  }
+
+  return WorkflowSchema.parse(JSON.parse(stdout));
+}
+
+// ============ Inner Loop — Native Circuits ============
+
+const CB_VERSION = "0.1.0";
+
+/** Walk up from source to find the .cb/ root. */
+function findCbRoot(source: string): string | null {
+  let current = resolve(source);
+  while (true) {
+    if (existsSync(join(current, ".cb"))) return current;
+    const parent = dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
+
+/** Compute a stable hash of the working directory state for run attestation. */
+function computeInputHash(source: string): string {
+  try {
+    const head = spawnSync("git", ["rev-parse", "HEAD"], {
+      cwd: source,
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    if (head.status === 0) {
+      const headHash = head.stdout.trim();
+      const dirty = spawnSync("git", ["status", "--porcelain"], {
+        cwd: source,
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      const dirtyContent = dirty.stdout?.trim() ?? "";
+      if (!dirtyContent) return hashString("git:" + headHash);
+      return hashString("git:" + headHash + ":dirty:" + hashString(dirtyContent));
+    }
+  } catch { /* not a git repo */ }
+  return hashDirectory(source, [".cb", "node_modules", ".git", "target", "dist"]);
+}
+
+/** Get VCS change hashes (recent commits) for the change_hashes field. */
+function getChangeHashes(source: string): string[] {
+  try {
+    const result = spawnSync(
+      "git",
+      ["log", "--format=%H", "-10"],
+      { cwd: source, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] },
+    );
+    if (result.status === 0) {
+      return result.stdout.trim().split("\n").filter(Boolean);
+    }
+  } catch { /* ignore */ }
+  return [];
+}
+
+/** Find circuit files in .cb/circuits/. */
+function discoverNativeCircuits(cbRoot: string): string[] {
+  const dir = join(cbRoot, ".cb", "circuits");
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir)
+    .filter((f) => f.endsWith(".ts") || f.endsWith(".js") || f.endsWith(".json"))
+    .map((f) => join(dir, f))
+    .sort();
+}
+
+/** Find the seal directory for a circuit file. Returns prefix or null. */
+function findSealForCircuit(cbRoot: string, circuitPath: string): string | null {
+  const circuitHash = hashFile(circuitPath);
+  const sealsDir = join(cbRoot, ".cb", "seals");
+  if (!existsSync(sealsDir)) return null;
+
+  for (const prefix of readdirSync(sealsDir)) {
+    const manifestPath = join(sealsDir, prefix, "manifest.json");
+    if (!existsSync(manifestPath)) continue;
+    try {
+      const m = JSON.parse(readFileSync(manifestPath, "utf-8"));
+      if (m.circuit_hash === circuitHash) return prefix;
+    } catch { /* skip */ }
+  }
+  return null;
+}
+
+/** Write a completed run + its steps into the local graph. */
+async function writeRunToGraph(params: {
+  cbRoot: string;
+  sealId: string;
+  sealNodeId: string;
+  source: string;
+  startedAt: Date;
+  finishedAt: Date;
+  status: RunStatus;
+  steps: StepResult[];
+}): Promise<string> {
+  if (!machineKeyExists()) return ""; // can't sign without machine key
+
+  const { cbRoot, sealId, sealNodeId, source, startedAt, finishedAt, status, steps } = params;
+  const graph = openOrCreateGraph(cbRoot);
+
+  // Build per-step log chunks + transition nodes
+  const logChunks: string[] = [];
+  const transitions: TransitionPayload[] = [];
+  let runLogHash = hashString("empty");
+
+  for (const step of steps) {
+    const combinedLog = step.output + (step.error ? "\n--- stderr ---\n" + step.error : "");
+    const chunkHash = graph.addLogChunk(Buffer.from(combinedLog, "utf-8"));
+    logChunks.push(chunkHash);
+
+    transitions.push({
+      run_id: "", // filled after run node created
+      name: step.id,
+      status: step.status === "passed" ? "Passed" : step.status === "failed" ? "Failed" : "Skipped",
+      started_at: step.started_at ?? startedAt.toISOString(),
+      duration_ms: step.duration_ms,
+      exit_code: step.exit_code,
+      log_hash: chunkHash,
+    });
+  }
+
+  // Combine all log chunks into run-level log hash
+  if (logChunks.length > 0) {
+    runLogHash = hashString(logChunks.join(","));
+  }
+
+  const inputHash = computeInputHash(source);
+  const changeHashes = getChangeHashes(source);
+  const cbPubkey = getMachinePubkeyBase64();
+
+  // Fields to sign (everything except signature and merkle_at_record)
+  const toSign = {
+    cb_pubkey: cbPubkey,
+    cb_version: CB_VERSION,
+    change_hashes: changeHashes,
+    finished_at: finishedAt.toISOString(),
+    input_hash: inputHash,
+    log_hash: runLogHash,
+    seal_id: sealId,
+    started_at: startedAt.toISOString(),
+    status,
+  };
+  const signData = Buffer.from(canonicalJSON(toSign), "utf-8");
+  const { signature } = signWithMachineKey(signData);
+
+  const runPayload: Omit<RunPayload, "merkle_at_record"> = {
+    ...toSign,
+    signature,
+  };
+
+  const { nodeId: runNodeId } = graph.addRun(sealNodeId, runPayload);
+
+  // Link log chunks to run
+  for (const chunk of logChunks) graph.linkLog(runNodeId, chunk, "log");
+
+  // Add transition nodes
+  for (const t of transitions) {
+    graph.addTransition(runNodeId, { ...t, run_id: runNodeId });
+  }
+
+  graph.close();
+  return runNodeId;
+}
+
+/** Ensure a synthetic seal node exists for GitHub Actions workflows (GH Actions bridge). */
+function ensureSyntheticSeal(
+  cbRoot: string,
+  workflowName: string,
+  cacheKey: string,
+): { sealNodeId: string; sealId: string } {
+  const graph = openOrCreateGraph(cbRoot);
+  const circuitHash = hashString("github-actions:" + workflowName);
+  const runnerHash = hashString("runner:" + cacheKey);
+  const sealHash = hashConcat(circuitHash, runnerHash);
+  const prefix = sealHash.slice(0, 12);
+  const sealId = `cb/${workflowName.replace(/\.ya?ml$/, "")}:${prefix}`;
+
+  // Check if already exists
+  const existing = graph.getSealByHash(sealHash);
+  if (existing) {
+    graph.close();
+    return { sealNodeId: existing.nodeId, sealId };
+  }
+
+  const nodeId = graph.addSeal({
+    circuit_hash: circuitHash,
+    runner_hash: runnerHash,
+    seal_hash: sealHash,
+    cb_version: CB_VERSION,
+    sealed_at: new Date().toISOString(),
+    seal_pubkey: "",
+    signature: "",
+    alg: "none",
+    circuit_name: workflowName,
+    circuit_path: "",
+  });
+
+  graph.close();
+  return { sealNodeId: nodeId, sealId };
+}
+
+/** Run all native circuits in .cb/circuits/ (or a specific one). */
+async function checkNativeCircuits(
+  options: CheckOptions,
+  source: string,
+): Promise<CheckResult[] | null> {
+  const cbRoot = findCbRoot(source);
+  if (!cbRoot) return null;
+
+  let circuitPaths: string[];
+  if (options.circuit) {
+    const p = resolve(source, options.circuit);
+    if (!existsSync(p)) {
+      console.error(chalk.red(`${s.cross} Circuit not found: ${options.circuit}`));
+      process.exit(1);
+    }
+    circuitPaths = [p];
+  } else {
+    circuitPaths = discoverNativeCircuits(cbRoot);
+  }
+
+  if (circuitPaths.length === 0) return null;
+
+  // Auto-generate machine identity key on first run so graph writes work
+  if (!machineKeyExists()) {
+    try {
+      generateMachineKey();
+    } catch { /* non-fatal — graph writes will be skipped */ }
+  }
+
+  // Boot smolvm for native circuit execution if available
+  let smolvmMachine: string | undefined;
+  let smolvmWorkdir: string | undefined;
+  if (hasSmolvmBinary()) {
+    const vmState = await getVmState(RUNNER_VM);
+    let vmRunning = vmState === "running";
+    if (vmState === "stopped") {
+      const startResult = await smolvm(["machine", "start", "--name", RUNNER_VM]);
+      vmRunning = startResult.exitCode === 0;
+    }
+    if (vmRunning) {
+      // Bootstrap Rust/rustup if not already installed — matches default GitHub Actions ubuntu runner environment
+      const rustCheck = await smolvm([
+        "machine", "exec", "--name", RUNNER_VM, "--",
+        "bash", "-c",
+        '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env" && rustup --version >/dev/null 2>&1',
+      ]);
+      if (rustCheck.exitCode !== 0) {
+        console.log(chalk.dim("  Bootstrapping Rust toolchain in runner VM..."));
+        await smolvm([
+          "machine", "exec", "--name", RUNNER_VM, "--",
+          "bash", "-c",
+          "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal",
+        ], { timeout: 120_000 });
+      }
+      // Install gh CLI if not present (needed for release workflows)
+      const ghCheck = await smolvm(["machine", "exec", "--name", RUNNER_VM, "--", "bash", "-c", "command -v gh"]);
+      if (ghCheck.exitCode !== 0) {
+        console.log(chalk.dim("  Bootstrapping gh CLI in runner VM..."));
+        const ghInstall = "GH_VER=$(curl -s https://api.github.com/repos/cli/cli/releases/latest | grep '\"tag_name\"' | sed 's/.*\"v\\([^\"]*\\)\".*/\\1/' 2>/dev/null || echo '2.68.0'); curl -sL \"https://github.com/cli/cli/releases/download/v${GH_VER}/gh_${GH_VER}_linux_arm64.tar.gz\" | tar xz -C /tmp/ && cp /tmp/gh_*/bin/gh /usr/local/bin/gh";
+        await smolvm(["machine", "exec", "--name", RUNNER_VM, "--", "bash", "-c", ghInstall], { timeout: 60_000 });
+      }
+      smolvmMachine = RUNNER_VM;
+      smolvmWorkdir = `/projects/${basename(resolve(source))}`;
+      // Stop the VM on any exit (clean or error) so RAM is freed
+      process.on("exit", () => {
+        Bun.spawnSync(["smolvm", "machine", "stop", "--name", RUNNER_VM]);
+      });
+    }
+  }
+
+  const config = loadConfig();
+  const allResults: CheckResult[] = [];
+  const startTime = performance.now();
+
+  for (const circuitPath of circuitPaths) {
+    const circuitName = basename(circuitPath);
+    console.log(chalk.bold(`${s.play} ${circuitName}`));
+
+    // ── Seal verification ──────────────────────────────────────────────
+    const sealPrefix = findSealForCircuit(cbRoot, circuitPath);
+    if (!sealPrefix) {
+      console.error(
+        chalk.red(`  ${s.cross} No seal found for ${circuitName}`),
+      );
+      console.error(
+        chalk.dim(`  Run \`cb seal ${circuitPath}\` to create a seal, then commit .cb/seals/`),
+      );
+      process.exit(1);
+    }
+
+    const sealDir = join(cbRoot, ".cb", "seals", sealPrefix);
+    const sealVerification = verifySeal(sealDir, circuitPath);
+    if (!sealVerification.valid) {
+      console.error(chalk.red(`  ${s.cross} Seal invalid: ${sealVerification.reason}`));
+      console.error(
+        chalk.dim(`  Run \`cb seal ${circuitPath}\` to re-seal, then commit .cb/seals/`),
+      );
+      process.exit(1);
+    }
+
+    // Warn if seal not committed
+    const gitCheck = spawnSync("git", ["status", "--porcelain", sealDir], {
+      encoding: "utf-8",
+      cwd: cbRoot,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    if (gitCheck.status === 0 && gitCheck.stdout?.trim()) {
+      console.log(
+        chalk.yellow(`  ${s.warn}  Seal uncommitted - commit .cb/seals/ to activate for policy gates`),
+      );
+    }
+
+    // Load the workflow by running the circuit file in a subprocess rooted at
+    // cbRoot so that module resolution finds node_modules from the project.
+    let workflow: Workflow;
+    try {
+      workflow = await loadCircuitWorkflow(circuitPath, cbRoot);
+    } catch (err) {
+      console.error(
+        chalk.red(`  ${s.cross} Failed to load circuit: ${err instanceof Error ? err.message : err}`),
+      );
+      process.exit(1);
+    }
+
+    console.log(chalk.dim(`  Seal: cb/${basename(circuitPath).split(".")[0]}:${sealPrefix}`));
+
+    // ── Execute ────────────────────────────────────────────────────────
+    const stepStartedAt = new Date();
+    const runStart = performance.now();
+
+    const runResult = await runCircuit(workflow, source, {
+      fromStep: options.from,
+      smolvmMachine,
+      smolvmWorkdir,
+      onStepStart: (id) => {
+        process.stdout.write(chalk.blue(`  ${s.play} ${id}...\n`));
+      },
+      onOutput: (line) => {
+        if (line.trim()) console.log(chalk.dim(`    ${line}`));
+      },
+      onStepEnd: (result) => {
+        if (result.status === "passed") {
+          console.log(`  ${chalk.green(s.check)} ${result.id} ${chalk.dim(`(${result.duration_ms}ms)`)}`);
+        } else if (result.status === "failed") {
+          console.log(`  ${chalk.red(s.cross)} ${result.id} ${chalk.dim(`(${result.duration_ms}ms)`)}`);
+        } else {
+          console.log(`  ${chalk.dim(s.skip)} ${result.id} (skipped)`);
+        }
+      },
+    });
+
+    const finishedAt = new Date();
+    const totalDuration = Math.round(performance.now() - runStart);
+
+    // ── Graph write-back ───────────────────────────────────────────────
+    const manifestPath = join(sealDir, "manifest.json");
+    let sealNodeId = "";
+    let sealId = `cb/${basename(circuitPath).split(".")[0]}:${sealPrefix}`;
+    try {
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+      const graph = openOrCreateGraph(cbRoot);
+      const existing = graph.getSealByHash(manifest.seal_hash);
+      sealNodeId = existing?.nodeId ?? graph.addSeal(manifest);
+      graph.close();
+      sealId = `cb/${manifest.circuit_name}:${sealPrefix}`;
+    } catch { /* best-effort */ }
+
+    if (sealNodeId) {
+      try {
+        await writeRunToGraph({
+          cbRoot,
+          sealId,
+          sealNodeId,
+          source,
+          startedAt: stepStartedAt,
+          finishedAt,
+          status: runResult.status === "passed" ? "Passed" : "Failed",
+          steps: runResult.steps.map((s) => ({
+            id: s.id,
+            status: s.status,
+            duration_ms: s.duration_ms,
+            exit_code: s.exit_code,
+            output: s.output,
+            error: s.error,
+            started_at: s.started_at,
+          })),
+        });
+      } catch { /* best-effort — don't fail the run for graph errors */ }
+    }
+
+    const checkResult: CheckResult = {
+      workflow: circuitName,
+      image: "local",
+      runner_cache_key: sealPrefix,
+      status: runResult.status,
+      steps: runResult.steps.map((s) => ({
+        id: s.id,
+        status: s.status,
+        duration_ms: s.duration_ms,
+        exit_code: s.exit_code ?? 0,
+        output: s.output,
+        error: s.error,
+      })),
+      duration_ms: totalDuration,
+      failed_step: runResult.failed_step,
+      runner_built: false,
+    };
+
+    allResults.push(checkResult);
+
+    if (runResult.status === "passed") {
+      console.log(chalk.green(`  ${s.check} ${circuitName} passed ${chalk.dim(`(${fmtDuration(totalDuration)})`)}`));
+    } else {
+      console.log(chalk.red(`  ${s.cross} ${circuitName} failed at '${runResult.failed_step}'`));
+      if (!options.from) {
+        console.log(chalk.dim(`  Retry from failed step: cb check -c ${circuitPath} --from ${runResult.failed_step}`));
+      }
+    }
+    console.log();
+  }
+
+  if (smolvmMachine) await stopVM(smolvmMachine);
+
+  return allResults;
+}
+
 // ============ Main Check Logic ============
 
 export async function check(
@@ -860,10 +1349,33 @@ export async function check(
   const source = resolve(options.source ?? ".");
   const startTime = performance.now();
 
+  // ── Native circuit path (primary) ─────────────────────────────────────────
+  if (!options.githubActions) {
+    const nativeResults = await checkNativeCircuits(options, source);
+    if (nativeResults !== null) {
+      if (options.json) console.log(JSON.stringify(nativeResults, null, 2));
+      const allPassed = nativeResults.every((r) => r.status === "passed");
+      const totalDuration = Math.round(performance.now() - startTime);
+      if (!options.json) {
+        console.log(chalk.dim("-".repeat(50)));
+        if (allPassed) {
+          console.log(chalk.green(`${s.check} All checks passed ${chalk.dim(`(${fmtDuration(totalDuration)})`)}`));
+        } else {
+          const failed = nativeResults.filter((r) => r.status === "failed");
+          console.log(chalk.red(`${s.cross} ${failed.length} of ${nativeResults.length} circuit(s) failed`));
+        }
+      }
+      if (!allPassed) process.exit(1);
+      return;
+    }
+    // No native circuits found — fall through to GitHub Actions bridge
+  }
+
+  // ── GitHub Actions bridge (legacy / explicit) ─────────────────────────────
   // Determine execution mode
   const useShell = options.shell === true;
   if (!useShell && !hasSmolvmBinary()) {
-    console.error(chalk.red("✗ smolvm binary not found in PATH."));
+    console.error(chalk.red(`${s.cross} smolvm binary not found in PATH.`));
     console.error(
       chalk.dim(
         "  Install smolvm (https://smolmachines.com) or use --shell for direct execution without VM isolation.",
@@ -881,7 +1393,7 @@ export async function check(
       if (existsSync(options.workflow)) {
         workflowPaths = [resolve(options.workflow)];
       } else {
-        console.error(chalk.red(`✗ Workflow not found: ${options.workflow}`));
+        console.error(chalk.red(`${s.cross} Workflow not found: ${options.workflow}`));
         process.exit(1);
       }
     } else {
@@ -890,7 +1402,7 @@ export async function check(
   } else {
     workflowPaths = discoverWorkflows(source);
     if (workflowPaths.length === 0) {
-      console.error(chalk.red("✗ No workflows found in .github/workflows/"));
+      console.error(chalk.red(`${s.cross} No workflows found in .github/workflows/`));
       console.error(
         chalk.dim("  Create a .github/workflows/ci.yml to get started."),
       );
@@ -903,7 +1415,7 @@ export async function check(
 
   for (const wfPath of workflowPaths) {
     const wfName = basename(wfPath);
-    console.log(chalk.bold(`▶ ${wfName}`));
+    console.log(chalk.bold(`${s.play} ${wfName}`));
 
     // ── Parse ──────────────────────────────────────────────────────
 
@@ -913,7 +1425,7 @@ export async function check(
       ghWorkflow = await fromGitHubActionsFile(wfPath);
       const validation = validateWorkflow(ghWorkflow.workflow);
       if (!validation.valid) {
-        console.error(chalk.red(`  ✗ Invalid workflow: ${wfName}`));
+        console.error(chalk.red(`  ${s.cross} Invalid workflow: ${wfName}`));
         for (const err of validation.errors) {
           console.error(chalk.red(`    ${err.message}`));
         }
@@ -922,7 +1434,7 @@ export async function check(
     } catch (err) {
       console.error(
         chalk.red(
-          `  ✗ Failed to parse ${wfName}: ${err instanceof Error ? err.message : err}`,
+          `  ${s.cross} Failed to parse ${wfName}: ${err instanceof Error ? err.message : err}`,
         ),
       );
       process.exit(1);
@@ -934,7 +1446,7 @@ export async function check(
     const jobEntries = Object.entries(raw.jobs);
 
     if (jobEntries.length === 0) {
-      console.log(chalk.dim(`  ⊘ ${wfName} — no jobs, skipping`));
+      console.log(chalk.dim(`  ${s.skip} ${wfName} - no jobs, skipping`));
       continue;
     }
 
@@ -999,7 +1511,7 @@ export async function check(
           } else {
             console.log(
               chalk.dim(
-                `  ⊘ ${jobId} — matrix job with no ubuntu variant, skipping`,
+                `  ${s.skip} ${jobId} — matrix job with no ubuntu variant, skipping`,
               ),
             );
             continue;
@@ -1007,7 +1519,7 @@ export async function check(
         } else {
           console.log(
             chalk.dim(
-              `  ⊘ ${jobId} — unresolvable matrix expression, skipping`,
+              `  ${s.skip} ${jobId} — unresolvable matrix expression, skipping`,
             ),
           );
           continue;
@@ -1019,7 +1531,7 @@ export async function check(
       // Skip non-ubuntu images (macos-latest, windows-latest, etc.)
       if (!image.startsWith("ubuntu")) {
         console.log(
-          chalk.dim(`  ⊘ ${jobId} — ${resolvedRunsOn} (not ubuntu), skipping`),
+          chalk.dim(`  ${s.skip} ${jobId} - ${resolvedRunsOn} (not ubuntu), skipping`),
         );
         continue;
       }
@@ -1027,7 +1539,7 @@ export async function check(
       const { usesSteps, runSteps } = separateSteps(job.steps);
 
       if (runSteps.length === 0) {
-        console.log(chalk.dim(`  ⊘ ${jobId} — no run: steps, skipping`));
+        console.log(chalk.dim(`  ${s.skip} ${jobId} - no run: steps, skipping`));
         continue;
       }
 
@@ -1046,7 +1558,7 @@ export async function check(
     }
 
     if (runnableJobs.length === 0) {
-      console.log(chalk.dim(`  ⊘ ${wfName} — no runnable jobs, skipping`));
+      console.log(chalk.dim(`  ${s.skip} ${wfName} - no runnable jobs, skipping`));
       continue;
     }
 
@@ -1083,11 +1595,11 @@ export async function check(
               output: "",
               error: "",
             });
-            console.log(chalk.dim(`    ⊘ ${cmd.id} (skipped)`));
+            console.log(chalk.dim(`    ${s.skip} ${cmd.id} (skipped)`));
             continue;
           }
 
-          process.stdout.write(chalk.blue(`    ▶ ${cmd.id}...`));
+          process.stdout.write(chalk.blue(`    ${s.play} ${cmd.id}...`));
           const result = await execLocally(cmd.command, source);
           const passed = result.exit_code === 0;
 
@@ -1102,11 +1614,11 @@ export async function check(
 
           if (passed) {
             console.log(
-              `\r    ${chalk.green("✓")} ${cmd.id} ${chalk.dim(`(${result.duration_ms}ms)`)}`,
+              `\r    ${chalk.green(s.check)} ${cmd.id} ${chalk.dim(`(${result.duration_ms}ms)`)}`,
             );
           } else {
             console.log(
-              `\r    ${chalk.red("✗")} ${cmd.id} ${chalk.dim(`(${result.duration_ms}ms)`)}`,
+              `\r    ${chalk.red(s.cross)} ${cmd.id} ${chalk.dim(`(${result.duration_ms}ms)`)}`,
             );
             const errorOutput = (result.stderr || result.stdout).trim();
             if (errorOutput) {
@@ -1139,12 +1651,12 @@ export async function check(
       if (wfPassed) {
         console.log(
           chalk.green(
-            `  ✓ ${wfName} passed ${chalk.dim(`(${totalDuration}ms)`)}`,
+            `  ${s.check} ${wfName} passed ${chalk.dim(`(${fmtDuration(totalDuration)})`)}`,
           ),
         );
       } else {
         console.log(
-          chalk.red(`  ✗ ${wfName} failed at step '${failedStep?.id}'`),
+          chalk.red(`  ${s.cross} ${wfName} failed at step '${failedStep?.id}'`),
         );
       }
       console.log();
@@ -1245,9 +1757,9 @@ export async function check(
       if (options.rebuild && existsSync(cachePath)) {
         console.log(chalk.dim("  --rebuild: ignoring cached runner"));
       } else if (dedupedUses.length === 0) {
-        console.log(chalk.dim("  No uses: steps — building baseline runner"));
+        console.log(chalk.dim("  No uses: steps - building baseline runner"));
       } else {
-        console.log(chalk.dim("  Cache miss — building sealed runner"));
+        console.log(chalk.dim("  Cache miss - building sealed runner"));
       }
 
       const built = await buildSealedRunner(
@@ -1257,12 +1769,12 @@ export async function check(
         cachePath,
       );
       if (!built) {
-        console.error(chalk.red("  ✗ Failed to build sealed runner."));
+        console.error(chalk.red(`  ${s.cross} Failed to build sealed runner.`));
         process.exit(1);
       }
       runnerBuilt = true;
     } else {
-      console.log(chalk.green("  ✓ Using cached runner"));
+      console.log(chalk.green(`  ${s.check} Using cached runner`));
     }
 
     // Boot the sealed runner with source mounted (or reuse existing)
@@ -1272,7 +1784,7 @@ export async function check(
     const bootDuration = Math.round(performance.now() - bootStart);
 
     if (!booted) {
-      console.error(chalk.red("  ✗ Failed to boot sealed runner."));
+      console.error(chalk.red(`  ${s.cross} Failed to boot sealed runner.`));
       process.exit(1);
     }
     // Compute the working directory inside the VM.
@@ -1283,7 +1795,7 @@ export async function check(
 
     console.log(
       chalk.green(
-        `  ✓ Runner ${reused ? "reused" : "ready"} ${chalk.dim(`(${bootDuration}ms)`)}`,
+        `  ${s.check} Runner ${reused ? "reused" : "ready"} ${chalk.dim(`(${fmtDuration(bootDuration)})`)}`,
       ),
     );
     console.log(chalk.dim(`  Working directory: ${projectWorkdir}`));
@@ -1314,7 +1826,7 @@ export async function check(
                 error: "",
               });
               console.log(
-                chalk.dim(`    ⊘ ${cmd.id} (skipped — before --from)`),
+                chalk.dim(`    ${s.skip} ${cmd.id} (skipped - before --from)`),
               );
               continue;
             }
@@ -1329,12 +1841,12 @@ export async function check(
               output: "",
               error: "",
             });
-            console.log(chalk.dim(`    ⊘ ${cmd.id} (skipped)`));
+            console.log(chalk.dim(`    ${s.skip} ${cmd.id} (skipped)`));
             continue;
           }
 
           // Execute the step
-          process.stdout.write(chalk.blue(`    ▶ ${cmd.id}...`));
+          process.stdout.write(chalk.blue(`    ${s.play} ${cmd.id}...`));
 
           const result = await execRunStep(
             cmd.command,
@@ -1355,11 +1867,11 @@ export async function check(
 
           if (passed) {
             console.log(
-              `\r    ${chalk.green("✓")} ${cmd.id} ${chalk.dim(`(${result.duration_ms}ms)`)}`,
+              `\r    ${chalk.green(s.check)} ${cmd.id} ${chalk.dim(`(${result.duration_ms}ms)`)}`,
             );
           } else {
             console.log(
-              `\r    ${chalk.red("✗")} ${cmd.id} ${chalk.dim(`(${result.duration_ms}ms)`)}`,
+              `\r    ${chalk.red(s.cross)} ${cmd.id} ${chalk.dim(`(${result.duration_ms}ms)`)}`,
             );
 
             // Show last 10 lines of error output
@@ -1389,7 +1901,7 @@ export async function check(
       );
       if (!allStepIds.includes(options.from ?? "")) {
         console.error(
-          chalk.red(`\n✗ Step '${options.from}' not found in ${wfName}`),
+          chalk.red(`\n${s.cross} Step '${options.from}' not found in ${wfName}`),
         );
         console.error(chalk.dim(`  Available steps: ${allStepIds.join(", ")}`));
         process.exit(1);
@@ -1417,13 +1929,13 @@ export async function check(
     if (wfPassed) {
       console.log(
         chalk.green(
-          `  ✓ ${wfName} passed ${chalk.dim(`(${totalDuration}ms)`)}`,
+          `  ${s.check} ${wfName} passed ${chalk.dim(`(${fmtDuration(totalDuration)})`)}`,
         ),
       );
     } else {
       console.log(
         chalk.red(
-          `  ✗ ${wfName} failed at step '${failedStep?.id}' ${chalk.dim(`(${totalDuration}ms)`)}`,
+          `  ${s.cross} ${wfName} failed at step '${failedStep?.id}' ${chalk.dim(`(${fmtDuration(totalDuration)})`)}`,
         ),
       );
       if (!options.from) {
@@ -1438,6 +1950,35 @@ export async function check(
     console.log();
   }
 
+  // ── Graph write-back (GitHub Actions bridge) ──────────────────────────────
+  const cbRoot = findCbRoot(source);
+  if (cbRoot && machineKeyExists()) {
+    const ghStartedAt = new Date(Date.now() - Math.round(performance.now() - startTime));
+    const ghFinishedAt = new Date();
+    for (const result of allResults) {
+      try {
+        const { sealNodeId, sealId } = ensureSyntheticSeal(
+          cbRoot,
+          result.workflow,
+          result.runner_cache_key,
+        );
+        await writeRunToGraph({
+          cbRoot,
+          sealId,
+          sealNodeId,
+          source,
+          startedAt: ghStartedAt,
+          finishedAt: ghFinishedAt,
+          status: result.status === "passed" ? "Passed" : "Failed",
+          steps: result.steps.map((s) => ({
+            ...s,
+            started_at: ghStartedAt.toISOString(),
+          })),
+        });
+      } catch { /* best-effort */ }
+    }
+  }
+
   // ── Summary ────────────────────────────────────────────────────
 
   if (options.json) {
@@ -1448,16 +1989,16 @@ export async function check(
   const totalDuration = Math.round(performance.now() - startTime);
 
   if (!options.json) {
-    console.log(chalk.dim("─".repeat(50)));
+    console.log(chalk.dim("-".repeat(50)));
     if (allPassed) {
       console.log(
-        chalk.green(`✓ All checks passed ${chalk.dim(`(${totalDuration}ms)`)}`),
+        chalk.green(`${s.check} All checks passed ${chalk.dim(`(${fmtDuration(totalDuration)})`)}`),
       );
     } else {
       const failed = allResults.filter((r) => r.status === "failed");
       console.log(
         chalk.red(
-          `✗ ${failed.length} of ${allResults.length} workflow(s) failed`,
+          `${s.cross} ${failed.length} of ${allResults.length} workflow(s) failed`,
         ),
       );
     }
@@ -1477,20 +2018,24 @@ export function registerCheckCommand(program: Command): void {
   program
     .command("check")
     .description(
-      "Run GitHub Actions workflows locally via sealed SmolVM runners",
+      "Run circuits in .cb/circuits/ (or GitHub Actions workflows with --github-actions)",
+    )
+    .option(
+      "-c, --circuit <path>",
+      "Run a specific circuit file (default: all in .cb/circuits/)",
     )
     .option(
       "-w, --workflow <path>",
-      "Path to a specific workflow file (default: auto-discover)",
+      "GitHub Actions: path to a specific workflow file",
     )
     .option(
       "--from <step>",
-      "Skip run: steps before this one (retry from a specific step)",
+      "Resume from a specific step (skip earlier steps)",
     )
     .option("--json", "Output structured JSON results")
     .option(
       "--shell",
-      "Run directly in host shell instead of SmolVM (no isolation)",
+      "GitHub Actions: run in host shell instead of SmolVM",
     )
     .option(
       "-s, --source <path>",
@@ -1498,6 +2043,10 @@ export function registerCheckCommand(program: Command): void {
       ".",
     )
     .option("--rebuild", "Force rebuild the sealed runner (ignore cache)")
+    .option(
+      "--github-actions",
+      "Explicitly run GitHub Actions workflows via the bridge (legacy mode)",
+    )
     .action(check);
 }
 
