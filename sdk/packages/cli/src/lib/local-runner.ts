@@ -118,6 +118,79 @@ async function execScript(
 
 // ─── Main executor ────────────────────────────────────────────────────────────
 
+function buildVmPreamble(workdir?: string): string {
+  const repoDir = workdir ?? "/workspace";
+  return [
+    "set -e",
+    '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env" || true',
+    '[ -f /etc/profile ] && . /etc/profile 2>/dev/null || true',
+    // sudo shim — runner is already root; strip leading '--' then exec the command directly
+    'command -v sudo >/dev/null 2>&1 || sudo() { [ "$1" = "--" ] && shift; "$@"; }',
+    // nvm activation + per-project node version switching
+    `if [ -f "$HOME/.nvm/nvm.sh" ]; then`,
+    `  . "$HOME/.nvm/nvm.sh"`,
+    `  _CB_NV=""`,
+    `  if [ -f "${repoDir}/.nvmrc" ]; then _CB_NV=$(cat "${repoDir}/.nvmrc" 2>/dev/null | tr -d '[:space:]'); fi`,
+    `  if [ -z "$_CB_NV" ] && [ -f "${repoDir}/.node-version" ]; then _CB_NV=$(cat "${repoDir}/.node-version" 2>/dev/null | tr -d '[:space:]'); fi`,
+    `  if [ -z "$_CB_NV" ] && [ -f "${repoDir}/package.json" ] && command -v node >/dev/null 2>&1; then`,
+    `    _CB_NV=$(node -e "try{var p=JSON.parse(require('fs').readFileSync('${repoDir}/package.json','utf8'));var e=(p.engines||{}).node||'';var m=e.match(/[0-9]+[.][0-9]+[.][0-9]+/);if(m)process.stdout.write(m[0]);}catch(ex){}" 2>/dev/null || echo '')`,
+    `  fi`,
+    `  if [ -n "$_CB_NV" ]; then nvm use "$_CB_NV" 2>/dev/null || (nvm install "$_CB_NV" 2>/dev/null && nvm use "$_CB_NV" 2>/dev/null) || true; fi`,
+    `fi`,
+    // GitHub Actions environment for inner-loop runs
+    'export RUNNER_OS="Linux"',
+    'export RUNNER_ARCH="$(uname -m | sed \'s/aarch64/ARM64/; s/x86_64/X64/\')"',
+    'export RUNNER_TEMP="/tmp"',
+    'export RUNNER_TOOL_CACHE="/opt/hostedtoolcache"',
+    'export GITHUB_SERVER_URL="${GITHUB_SERVER_URL:-https://github.com}"',
+    'export GITHUB_API_URL="${GITHUB_API_URL:-https://api.github.com}"',
+    'export GITHUB_RUN_ID="${GITHUB_RUN_ID:-1}"',
+    'export GITHUB_RUN_NUMBER="${GITHUB_RUN_NUMBER:-1}"',
+    'export GITHUB_WORKFLOW="${GITHUB_WORKFLOW:-local}"',
+    'export GITHUB_JOB="${GITHUB_JOB:-local}"',
+    `export GITHUB_WORKSPACE="${repoDir}"`,
+    'export GITHUB_OUTPUT="${GITHUB_OUTPUT:-/tmp/.cb/github_output}"',
+    'export GITHUB_ENV="${GITHUB_ENV:-/tmp/.cb/github_env}"',
+    'export GITHUB_PATH="${GITHUB_PATH:-/tmp/.cb/github_path}"',
+    'export GITHUB_STEP_SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"',
+    'mkdir -p /tmp/.cb /opt/hostedtoolcache',
+    'touch "$GITHUB_OUTPUT" "$GITHUB_ENV" "$GITHUB_PATH"',
+    // Source env/path written by previous steps
+    'if [ -s "$GITHUB_ENV" ]; then while IFS= read -r _l || [ -n "$_l" ]; do [ -n "$_l" ] && export "$_l" 2>/dev/null || true; done < "$GITHUB_ENV"; fi',
+    'if [ -s "$GITHUB_PATH" ]; then while IFS= read -r _l || [ -n "$_l" ]; do [ -n "$_l" ] && export PATH="$_l:$PATH"; done < "$GITHUB_PATH"; fi',
+    // Trust virtiofs-mounted directories (host UID != VM root UID)
+    'git config --global --add safe.directory \'*\' 2>/dev/null || true',
+    // Default all GitHub context vars to empty string so set -u scripts never see unbound vars
+    'export GITHUB_SHA="${GITHUB_SHA:-}"',
+    'export GITHUB_REF="${GITHUB_REF:-}"',
+    'export GITHUB_REF_NAME="${GITHUB_REF_NAME:-}"',
+    'export GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-}"',
+    'export GITHUB_ACTOR="${GITHUB_ACTOR:-}"',
+    'export GITHUB_HEAD_REF="${GITHUB_HEAD_REF:-}"',
+    'export GITHUB_BASE_REF="${GITHUB_BASE_REF:-}"',
+    'export GITHUB_EVENT_NAME="${GITHUB_EVENT_NAME:-}"',
+    'export GITHUB_ACTION="${GITHUB_ACTION:-}"',
+    // Derive GitHub context from git if available (overrides the empty defaults above)
+    `if command -v git >/dev/null 2>&1 && git -C "${repoDir}" rev-parse --git-dir >/dev/null 2>&1; then`,
+    `  _CB_SHA=$(git -C "${repoDir}" rev-parse HEAD 2>/dev/null || echo '')`,
+    `  _CB_BRANCH=$(git -C "${repoDir}" branch --show-current 2>/dev/null || echo '')`,
+    `  _CB_TAG=$(git -C "${repoDir}" describe --exact-match --tags HEAD 2>/dev/null || echo '')`,
+    `  _CB_REMOTE=$(git -C "${repoDir}" remote get-url origin 2>/dev/null | sed 's|.*github\\.com[:/]||; s|\\.git$||' || echo '')`,
+    `  _CB_ACTOR=$(git -C "${repoDir}" config user.name 2>/dev/null || echo '')`,
+    '  [ -n "${_CB_SHA}" ] && export GITHUB_SHA="${_CB_SHA}"',
+    '  [ -n "${_CB_BRANCH}${_CB_TAG}" ] && export GITHUB_REF_NAME="${_CB_BRANCH:-${_CB_TAG}}"',
+    '  if [ -n "${_CB_BRANCH:-}" ]; then export GITHUB_REF="refs/heads/${_CB_BRANCH}"; elif [ -n "${_CB_TAG:-}" ]; then export GITHUB_REF="refs/tags/${_CB_TAG}"; fi',
+    '  [ -n "${_CB_REMOTE}" ] && export GITHUB_REPOSITORY="${_CB_REMOTE}"',
+    '  [ -n "${_CB_ACTOR}" ] && export GITHUB_ACTOR="${_CB_ACTOR}"',
+    'fi',
+    // Minimal event stub so scripts can `cat "$GITHUB_EVENT_PATH"`
+    'if [ -z "${GITHUB_EVENT_PATH:-}" ] || [ ! -f "${GITHUB_EVENT_PATH:-/nonexistent}" ]; then',
+    '  export GITHUB_EVENT_PATH="/tmp/.cb/github_event.json"',
+    '  printf \'{"repository":{"full_name":"%s"}}\' "${GITHUB_REPOSITORY:-}" > "$GITHUB_EVENT_PATH"',
+    'fi',
+  ].join("\n");
+}
+
 async function execViaSmolvm(
   script: string,
   machine: string,
@@ -125,12 +198,7 @@ async function execViaSmolvm(
   onOutput?: (line: string) => void,
 ): Promise<{ exit_code: number; stdout: string; stderr: string; duration_ms: number }> {
   const start = performance.now();
-  const parts: string[] = [
-    "set -e",
-    // Source common env files to get rustup/cargo/etc. in PATH for non-login shells
-    '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env" || true',
-    '[ -f /etc/profile ] && . /etc/profile 2>/dev/null || true',
-  ];
+  const parts: string[] = [buildVmPreamble(workdir)];
   if (workdir) parts.push(`cd ${workdir} || true`);
   parts.push(script);
   const proc = Bun.spawn(

@@ -29,9 +29,6 @@ import {
   fromGitHubActionsFile,
   validateWorkflow,
   WorkflowSchema,
-  resolveAction,
-  BASELINE_INSTALL_STEPS,
-  GITHUB_ACTIONS_SHIM,
   RUN_STEP_PREAMBLE,
   runnerCacheKey,
   runnerCachePath,
@@ -47,6 +44,19 @@ import { runCircuit } from "../lib/local-runner";
 import { verifySeal } from "./seal";
 import { loadConfig } from "../lib/config";
 import { s } from "../lib/symbols";
+import {
+  smolvm,
+  hasSmolvmBinary,
+  getVmState,
+  createBuilderVM,
+  execInBuilder,
+  sealBuilder,
+  destroyVM,
+  stopVM,
+  buildSealedRunner,
+  BUILDER_VM_PREFIX,
+  RUNNER_VM,
+} from "../lib/smolvm";
 
 // ============ Types ============
 
@@ -59,6 +69,7 @@ interface CheckOptions {
   shell?: boolean;
   rebuild?: boolean;
   githubActions?: boolean; // force GitHub Actions bridge mode
+  target?: string;         // positional seal ID or path (cb/<name>:<prefix>)
 }
 
 interface StepResult {
@@ -118,11 +129,6 @@ interface RawWorkflow {
 // ============ Constants ============
 
 /** VM name for the builder (temporary, deleted after seal). */
-const BUILDER_VM_PREFIX = "cb-build-";
-
-/** VM name for the runner (created per check run). */
-const RUNNER_VM = "cb-check";
-
 // ============ Workflow Discovery ============
 
 function discoverWorkflows(source: string): string[] {
@@ -232,406 +238,6 @@ function resolveRunsOnImage(runsOn: string | string[]): string {
   return imageMap[label] ?? label;
 }
 
-// ============ SmolVM Subprocess Helpers ============
-
-async function smolvm(
-  args: string[],
-  options?: { timeout?: number },
-): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-  const proc = Bun.spawn(["smolvm", ...args], {
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  if (options?.timeout) {
-    timer = setTimeout(() => {
-      proc.kill();
-    }, options.timeout);
-  }
-
-  const [stdout, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ]);
-
-  const exitCode = await proc.exited;
-
-  if (timer) clearTimeout(timer);
-
-  return { exitCode, stdout, stderr };
-}
-
-function hasSmolvmBinary(): boolean {
-  try {
-    const proc = Bun.spawnSync(["smolvm", "--version"], {
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    return proc.exitCode === 0;
-  } catch {
-    return false;
-  }
-}
-
-// ============ Builder VM Lifecycle ============
-
-async function createBuilderVM(
-  vmName: string,
-  image: string,
-): Promise<boolean> {
-  // Clean up any leftover builder VM with this name
-  await smolvm(["machine", "stop", "--name", vmName]);
-  await smolvm(["machine", "delete", vmName, "-f"]);
-
-  const create = await smolvm([
-    "machine",
-    "create",
-    "--image",
-    image,
-    "--net",
-    vmName,
-  ]);
-
-  if (create.exitCode !== 0) {
-    console.error(
-      chalk.red(`  Failed to create builder VM: ${create.stderr.trim()}`),
-    );
-    return false;
-  }
-
-  const start = await smolvm(["machine", "start", "--name", vmName]);
-  if (start.exitCode !== 0) {
-    console.error(
-      chalk.red(`  Failed to start builder VM: ${start.stderr.trim()}`),
-    );
-    return false;
-  }
-
-  return true;
-}
-
-async function execInBuilder(
-  vmName: string,
-  script: string,
-  label?: string,
-): Promise<{
-  exitCode: number;
-  stdout: string;
-  stderr: string;
-  duration_ms: number;
-}> {
-  const start = performance.now();
-
-  if (label) {
-    console.log(chalk.dim(`    ${s.play} ${label}`));
-  }
-
-  // Stream output live so the user can see what's happening during
-  // long installs (apt-get, rustup, etc.) instead of staring at a
-  // frozen terminal for minutes.
-  const proc = Bun.spawn(
-    ["smolvm", "machine", "exec", "--name", vmName, "--stream", "--", "bash", "-c", script],
-    { stdout: "pipe", stderr: "pipe" },
-  );
-
-  const stdoutChunks: string[] = [];
-  const stderrChunks: string[] = [];
-
-  // 10 minute timeout for builder execs (baseline apt-get can take 3-5 min)
-  const TIMEOUT_MS = 600_000;
-  let killed = false;
-  const timer = setTimeout(() => {
-    killed = true;
-    proc.kill();
-  }, TIMEOUT_MS);
-
-  // Stream stdout line by line, dimmed and indented
-  const streamLines = async (
-    stream: ReadableStream<Uint8Array>,
-    chunks: string[],
-    prefix: string,
-  ) => {
-    const reader = stream.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      const text = decoder.decode(value, { stream: true });
-      chunks.push(text);
-      buffer += text;
-
-      // Print complete lines as they arrive
-      const lines = buffer.split("\n");
-      // Keep the last (possibly incomplete) line in the buffer
-      buffer = lines.pop() ?? "";
-
-      for (const line of lines) {
-        if (line.trim().length > 0) {
-          console.log(chalk.dim(`${prefix}${line}`));
-        }
-      }
-    }
-
-    // Flush remaining buffer
-    if (buffer.trim().length > 0) {
-      console.log(chalk.dim(`${prefix}${buffer}`));
-    }
-  };
-
-  await Promise.all([
-    streamLines(
-      proc.stdout as ReadableStream<Uint8Array>,
-      stdoutChunks,
-      "      ",
-    ),
-    streamLines(
-      proc.stderr as ReadableStream<Uint8Array>,
-      stderrChunks,
-      "      ",
-    ),
-  ]);
-
-  const exitCode = await proc.exited;
-  clearTimeout(timer);
-
-  const duration_ms = Math.round(performance.now() - start);
-  const stdout = stdoutChunks.join("");
-  const stderr = stderrChunks.join("");
-
-  if (label) {
-    if (killed) {
-      console.log(
-        chalk.red(`    ${s.cross} ${label} (timed out after ${TIMEOUT_MS / 1000}s)`),
-      );
-    } else if (exitCode === 0) {
-      console.log(
-        `    ${chalk.green(s.check)} ${label} ${chalk.dim(`(${fmtDuration(duration_ms)})`)}`,
-      );
-    } else {
-      console.log(
-        `    ${chalk.red(s.cross)} ${label} (exit code ${exitCode}) ${chalk.dim(`(${fmtDuration(duration_ms)})`)}`,
-      );
-    }
-  }
-
-  return { exitCode, stdout, stderr, duration_ms };
-}
-
-async function sealBuilder(
-  vmName: string,
-  outputPath: string,
-): Promise<boolean> {
-  // smolvm pack create --from-vm requires the VM to be stopped first
-  const stop = await smolvm(["machine", "stop", "--name", vmName]);
-  if (stop.exitCode !== 0) {
-    console.error(
-      chalk.red(
-        `    Failed to stop builder VM before seal: ${stop.stderr.trim()}`,
-      ),
-    );
-    return false;
-  }
-
-  // Remove .smolmachine extension — smolvm pack create adds it
-  const outputBase = outputPath.replace(/\.smolmachine$/, "");
-
-  const result = await smolvm(
-    ["pack", "create", "--from-vm", vmName, "-o", outputBase],
-    { timeout: 300_000 },
-  ); // 5 minute timeout — packing a full toolchain can be large
-
-  if (result.exitCode !== 0) {
-    const output = (result.stderr || result.stdout).trim();
-    if (output) {
-      console.error(chalk.red("    Seal error output:"));
-      for (const line of output.split("\n").slice(-10)) {
-        console.error(chalk.red(`      ${line}`));
-      }
-    } else {
-      console.error(
-        chalk.red(`    Seal exited with code ${result.exitCode} (no output)`),
-      );
-    }
-  }
-
-  return result.exitCode === 0;
-}
-
-async function destroyVM(vmName: string): Promise<void> {
-  await smolvm(["machine", "stop", "--name", vmName]);
-  await smolvm(["machine", "delete", vmName, "-f"]);
-}
-
-async function stopVM(vmName: string): Promise<void> {
-  await smolvm(["machine", "stop", "--name", vmName]);
-}
-
-/**
- * Get the state of a VM from `smolvm machine ls --json`.
- *
- * Returns the machine's state string ("running", "stopped", etc.)
- * or null if the VM doesn't exist. This is reliable — unlike
- * `smolvm machine status` which returns exit 0 for non-existent VMs.
- */
-async function getVmState(
-  vmName: string,
-): Promise<"running" | "stopped" | string | null> {
-  const result = await smolvm(["machine", "ls", "--json"]);
-  if (result.exitCode !== 0) return null;
-
-  try {
-    const machines = JSON.parse(result.stdout);
-    const vm = machines.find((m: { name: string }) => m.name === vmName);
-    return vm?.state ?? null;
-  } catch {
-    return null;
-  }
-}
-
-// ============ Sealed Runner Build ============
-
-/**
- * Build a sealed runner: install baseline packages + resolved `uses:` scripts,
- * then pack into a `.smolmachine`.
- */
-async function buildSealedRunner(
-  image: string,
-  usesSteps: {
-    uses: string;
-    with?: Record<string, unknown>;
-    name?: string;
-    env?: Record<string, string>;
-  }[],
-  cacheKey: string,
-  cachePath: string,
-): Promise<boolean> {
-  const builderVM = `${BUILDER_VM_PREFIX}${cacheKey.slice(0, 12)}`;
-
-  console.log(chalk.bold("  Building sealed runner..."));
-  console.log(chalk.dim(`    Base image: ${image}`));
-  console.log(
-    chalk.dim(`    Tools to install: ${usesSteps.length} uses: step(s)`),
-  );
-
-  // 1. Create builder VM
-  const created = await createBuilderVM(builderVM, image);
-  if (!created) return false;
-
-  try {
-    // 2. Install baseline packages (one exec per group to avoid pipe-buffering hangs)
-    for (const step of BASELINE_INSTALL_STEPS) {
-      const result = await execInBuilder(
-        builderVM,
-        step.script,
-        `baseline: ${step.label}`,
-      );
-      if (result.exitCode !== 0) {
-        console.error(
-          chalk.red(`    Baseline install failed at: ${step.label}`),
-        );
-        const lines = (result.stderr || result.stdout)
-          .trim()
-          .split("\n")
-          .slice(-5);
-        for (const line of lines) {
-          console.error(chalk.red(`      ${line}`));
-        }
-        return false;
-      }
-    }
-
-    // 3. Set up GitHub Actions environment shim
-    const shim = await execInBuilder(
-      builderVM,
-      GITHUB_ACTIONS_SHIM,
-      "Setting up GitHub Actions environment",
-    );
-    if (shim.exitCode !== 0) {
-      console.error(chalk.red("    Shim setup failed:"));
-      const lines = (shim.stderr || shim.stdout).trim().split("\n").slice(-5);
-      for (const line of lines) {
-        console.error(chalk.red(`      ${line}`));
-      }
-      return false;
-    }
-
-    // 4. Resolve and execute each `uses:` step's install scripts
-    for (const step of usesSteps) {
-      const label = step.name ?? step.uses;
-
-      const resolved = await resolveAction(step.uses, step.with);
-      if (!resolved || resolved.length === 0) {
-        console.log(chalk.dim(`    ${s.skip} ${label} (no install steps)`));
-        continue;
-      }
-
-      // Combine all resolved scripts into a single bash invocation.
-      // Prefix with _gh_source_env so each script sees env changes from prior steps.
-      const combinedScript = [
-        // Re-establish the shim functions (they don't persist across exec sessions)
-        GITHUB_ACTIONS_SHIM,
-        "",
-        // Source env/path accumulated from prior steps
-        "_gh_source_env",
-        "",
-        // Set step-level env vars
-        ...(step.env
-          ? Object.entries(step.env).map(
-              ([k, v]) => `export ${k}=${shellQuote(v)}`,
-            )
-          : []),
-        "",
-        // The resolved install scripts
-        ...resolved.map((r) => r.run),
-      ].join("\n");
-
-      const result = await execInBuilder(
-        builderVM,
-        combinedScript,
-        `Installing ${label}`,
-      );
-      if (result.exitCode !== 0) {
-        console.error(chalk.red(`    Install script for '${label}' failed:`));
-        const lines = (result.stderr || result.stdout)
-          .trim()
-          .split("\n")
-          .slice(-10);
-        for (const line of lines) {
-          console.error(chalk.red(`      ${line}`));
-        }
-        return false;
-      }
-    }
-
-    // 5. Seal the builder VM into a .smolmachine
-    console.log(chalk.dim("    Sealing runner..."));
-    const sealStart = performance.now();
-
-    // Ensure cache directory exists
-    mkdirSync(RUNNER_CACHE_DIR, { recursive: true });
-
-    const sealed = await sealBuilder(builderVM, cachePath);
-    const sealDuration = Math.round(performance.now() - sealStart);
-
-    if (!sealed) {
-      console.error(chalk.red("    Failed to seal runner."));
-      return false;
-    }
-
-    console.log(
-      chalk.green(`    ${s.check} Runner sealed ${chalk.dim(`(${fmtDuration(sealDuration)})`)}`),
-    );
-    console.log(chalk.dim(`    Cached at: ${cachePath}`));
-    return true;
-  } finally {
-    // Always clean up the builder VM
-    await destroyVM(builderVM);
-  }
-}
 
 // ============ Run Steps in Sealed Runner ============
 
@@ -1147,14 +753,68 @@ async function checkNativeCircuits(
   let smolvmMachine: string | undefined;
   let smolvmWorkdir: string | undefined;
   if (hasSmolvmBinary()) {
-    const vmState = await getVmState(RUNNER_VM);
+    const sourceAbs = resolve(source);
+    const guestWorkdir = `/projects/${basename(sourceAbs)}`;
+    const volumeMount = `${sourceAbs}:${guestWorkdir}`;
+
+    let vmState = await getVmState(RUNNER_VM);
     let vmRunning = vmState === "running";
+
+    if (vmState === null) {
+      // VM doesn't exist yet — create it with the source directory mounted
+      console.log(chalk.dim(`  Creating ${RUNNER_VM} VM (first run)...`));
+      const create = await smolvm([
+        "machine", "create",
+        "--image", "ubuntu:24.04",
+        "--net",
+        "-v", volumeMount,
+        RUNNER_VM,
+      ]);
+      if (create.exitCode === 0) {
+        vmState = "stopped";
+      } else {
+        console.error(chalk.red(`  Failed to create runner VM: ${create.stderr.trim()}`));
+      }
+    }
+
+    if (vmState === "running") {
+      // Check if the source mount is accessible; if not, stop and add it
+      const wdCheck = await smolvm([
+        "machine", "exec", "--name", RUNNER_VM, "--", "bash", "-c",
+        `[ -d '${guestWorkdir}' ]`,
+      ]);
+      if (wdCheck.exitCode !== 0) {
+        await smolvm(["machine", "stop", "--name", RUNNER_VM]);
+        vmState = "stopped";
+        vmRunning = false;
+      }
+    }
+
     if (vmState === "stopped") {
+      // Ensure the source directory is mounted (idempotent — ignore error if already present)
+      await smolvm(["machine", "update", "-v", volumeMount, RUNNER_VM]);
       const startResult = await smolvm(["machine", "start", "--name", RUNNER_VM]);
       vmRunning = startResult.exitCode === 0;
     }
+
     if (vmRunning) {
-      // Bootstrap Rust/rustup if not already installed — matches default GitHub Actions ubuntu runner environment
+      // Ensure essential packages are present (fresh ubuntu:24.04 has none)
+      const curlCheck = await smolvm(["machine", "exec", "--name", RUNNER_VM, "--", "bash", "-c", "command -v curl && command -v git"]);
+      if (curlCheck.exitCode !== 0) {
+        console.log(chalk.dim("  Installing baseline packages in runner VM (first run, may take a few minutes)..."));
+        const baselineInstall = [
+          "apt-get update -qq",
+          "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl wget ca-certificates git gnupg",
+        ].join(" && ");
+        const baselineResult = await smolvm(
+          ["machine", "exec", "--name", RUNNER_VM, "--", "bash", "-c", baselineInstall],
+          { timeout: 180_000 },
+        );
+        if (baselineResult.exitCode !== 0) {
+          console.error(chalk.red(`  Failed to install baseline packages: ${(baselineResult.stderr || baselineResult.stdout).trim().split("\n").slice(-3).join(" ")}`));
+        }
+      }
+      // Bootstrap Rust/rustup if not already installed
       const rustCheck = await smolvm([
         "machine", "exec", "--name", RUNNER_VM, "--",
         "bash", "-c",
@@ -1168,15 +828,38 @@ async function checkNativeCircuits(
           "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal",
         ], { timeout: 120_000 });
       }
-      // Install gh CLI if not present (needed for release workflows)
+      // Install gh CLI if not present
       const ghCheck = await smolvm(["machine", "exec", "--name", RUNNER_VM, "--", "bash", "-c", "command -v gh"]);
       if (ghCheck.exitCode !== 0) {
         console.log(chalk.dim("  Bootstrapping gh CLI in runner VM..."));
         const ghInstall = "GH_VER=$(curl -s https://api.github.com/repos/cli/cli/releases/latest | grep '\"tag_name\"' | sed 's/.*\"v\\([^\"]*\\)\".*/\\1/' 2>/dev/null || echo '2.68.0'); curl -sL \"https://github.com/cli/cli/releases/download/v${GH_VER}/gh_${GH_VER}_linux_arm64.tar.gz\" | tar xz -C /tmp/ && cp /tmp/gh_*/bin/gh /usr/local/bin/gh";
         await smolvm(["machine", "exec", "--name", RUNNER_VM, "--", "bash", "-c", ghInstall], { timeout: 60_000 });
       }
+      // Install Node.js LTS if not present (many actions call node/npm/yarn/npx)
+      const nodeCheck = await smolvm(["machine", "exec", "--name", RUNNER_VM, "--", "bash", "-c", "node --version >/dev/null 2>&1"]);
+      if (nodeCheck.exitCode !== 0) {
+        console.log(chalk.dim("  Bootstrapping Node.js LTS in runner VM..."));
+        const nodeInstall = [
+          "curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -",
+          "apt-get install -y --no-install-recommends nodejs",
+          "corepack enable",
+        ].join(" && ");
+        await smolvm(["machine", "exec", "--name", RUNNER_VM, "--", "bash", "-c", nodeInstall], { timeout: 120_000 });
+      }
+      // Install nvm for per-project node version switching
+      const nvmCheck = await smolvm([
+        "machine", "exec", "--name", RUNNER_VM, "--", "bash", "-c",
+        '[ -f "$HOME/.nvm/nvm.sh" ] && . "$HOME/.nvm/nvm.sh" && nvm --version >/dev/null 2>&1',
+      ]);
+      if (nvmCheck.exitCode !== 0) {
+        console.log(chalk.dim("  Bootstrapping nvm in runner VM..."));
+        await smolvm([
+          "machine", "exec", "--name", RUNNER_VM, "--", "bash", "-c",
+          "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash",
+        ], { timeout: 60_000 });
+      }
       smolvmMachine = RUNNER_VM;
-      smolvmWorkdir = `/projects/${basename(resolve(source))}`;
+      smolvmWorkdir = guestWorkdir;
       // Stop the VM on any exit (clean or error) so RAM is freed
       process.on("exit", () => {
         Bun.spawnSync(["smolvm", "machine", "stop", "--name", RUNNER_VM]);
@@ -1340,14 +1023,71 @@ async function checkNativeCircuits(
   return allResults;
 }
 
+// ============ Seal ID Resolution ============
+
+/**
+ * Resolve a seal ID (cb/<name>:<prefix>) to a circuit/workflow path.
+ * Returns null if the string is not a seal ID or the seal can't be found.
+ */
+function resolveSealTarget(
+  target: string,
+  source: string,
+): { circuitPath: string; isGHA: boolean } | null {
+  // Must match cb/<name>:<hex-prefix>
+  if (!target.startsWith("cb/") || !target.includes(":")) return null;
+
+  const prefix = target.split(":")[1];
+  if (!prefix) return null;
+
+  const cbRoot = findCbRoot(source);
+  if (!cbRoot) return null;
+
+  const manifestPath = join(cbRoot, ".cb", "seals", prefix, "manifest.json");
+  if (!existsSync(manifestPath)) {
+    console.error(chalk.red(`${s.cross} Seal not found: ${target}`));
+    console.error(chalk.dim(`  Expected manifest at ${manifestPath}`));
+    return null;
+  }
+
+  let manifest: { circuit_path: string; circuit_name: string };
+  try {
+    manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+  } catch {
+    console.error(chalk.red(`${s.cross} Could not read seal manifest: ${manifestPath}`));
+    return null;
+  }
+
+  const circuitPath = manifest.circuit_path;
+  if (!existsSync(circuitPath)) {
+    console.error(chalk.red(`${s.cross} Circuit file from seal not found: ${circuitPath}`));
+    return null;
+  }
+
+  const isGHA = circuitPath.endsWith(".yml") || circuitPath.endsWith(".yaml");
+  return { circuitPath, isGHA };
+}
+
 // ============ Main Check Logic ============
 
 export async function check(
+  target: string | undefined,
   options: CheckOptions,
   _command: Command,
 ): Promise<void> {
   const source = resolve(options.source ?? ".");
   const startTime = performance.now();
+
+  // ── Seal ID resolution ────────────────────────────────────────────────────
+  if (target) {
+    const resolved = resolveSealTarget(target, source);
+    if (!resolved) process.exit(1);
+    if (resolved.isGHA) {
+      options.workflow = resolved.circuitPath;
+      options.githubActions = true;
+    } else {
+      options.circuit = resolved.circuitPath;
+    }
+  }
 
   // ── Native circuit path (primary) ─────────────────────────────────────────
   if (!options.githubActions) {
@@ -1767,6 +1507,7 @@ export async function check(
         dedupedUses,
         cacheKey,
         cachePath,
+        { repoRoot: source },
       );
       if (!built) {
         console.error(chalk.red(`  ${s.cross} Failed to build sealed runner.`));
@@ -2016,9 +1757,9 @@ export async function check(
  */
 export function registerCheckCommand(program: Command): void {
   program
-    .command("check")
+    .command("check [target]")
     .description(
-      "Run circuits in .cb/circuits/ (or GitHub Actions workflows with --github-actions)",
+      "Run circuits. Pass a seal ID (cb/<name>:<prefix>) to run a specific circuit.",
     )
     .option(
       "-c, --circuit <path>",

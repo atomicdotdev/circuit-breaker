@@ -9,7 +9,7 @@
 import type { Command } from "commander";
 import chalk from "chalk";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { resolve, basename } from "node:path";
+import { resolve, basename, dirname, join } from "node:path";
 import { parse as parseYAML } from "yaml";
 import { s } from "../lib/symbols";
 
@@ -57,11 +57,29 @@ interface ActionYaml {
 
 const actionCache = new Map<string, ActionYaml | null>();
 
-async function fetchAction(uses: string): Promise<ActionYaml | null> {
-  if (actionCache.has(uses)) return actionCache.get(uses)!;
+async function fetchAction(uses: string, repoRoot?: string): Promise<ActionYaml | null> {
+  const cacheKey = `${repoRoot ?? ""}:${uses}`;
+  if (actionCache.has(cacheKey)) return actionCache.get(cacheKey)!;
+
+  // Local composite action (./path/to/action or ../path)
+  if (uses.startsWith("./") || uses.startsWith("../")) {
+    if (!repoRoot) { actionCache.set(cacheKey, null); return null; }
+    for (const filename of ["action.yml", "action.yaml"]) {
+      const actionPath = join(repoRoot, uses, filename);
+      try {
+        if (existsSync(actionPath)) {
+          const parsed = parseYAML(readFileSync(actionPath, "utf-8")) as ActionYaml;
+          actionCache.set(cacheKey, parsed);
+          return parsed;
+        }
+      } catch { /* parse error */ }
+    }
+    actionCache.set(cacheKey, null);
+    return null;
+  }
 
   const match = uses.match(/^([^/@]+\/[^/@]+)@(.+)$/);
-  if (!match) { actionCache.set(uses, null); return null; }
+  if (!match) { actionCache.set(cacheKey, null); return null; }
 
   const [, repo, ref] = match;
   for (const filename of ["action.yml", "action.yaml"]) {
@@ -70,13 +88,13 @@ async function fetchAction(uses: string): Promise<ActionYaml | null> {
       const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
       if (res.ok) {
         const parsed = parseYAML(await res.text()) as ActionYaml;
-        actionCache.set(uses, parsed);
+        actionCache.set(cacheKey, parsed);
         return parsed;
       }
     } catch { /* network/timeout — try next */ }
   }
 
-  actionCache.set(uses, null);
+  actionCache.set(cacheKey, null);
   return null;
 }
 
@@ -131,6 +149,11 @@ function subst(text: string, inputs: Record<string, string>, ctx: SubstContext =
     const stepOut = e.match(/^steps\.([a-zA-Z0-9_-]+)\.outputs\.([a-zA-Z0-9_]+)$/);
     if (stepOut) return `$_step_${stepOut[1].replace(/[^a-zA-Z0-9]/g, "_")}_${stepOut[2]}`;
 
+    // needs.X.result — if we're executing, the dependency succeeded
+    if (/^needs\.[a-zA-Z0-9_-]+\.result$/.test(e)) return "success";
+    // needs.X.outputs.Y — not evaluable; leave empty
+    if (/^needs\.[a-zA-Z0-9_-]+\.outputs\./.test(e)) return "";
+
     // Ternary: runner.os == 'Windows' && X || Y  →  Y
     const winTrue = e.match(/runner\.os\s*==\s*['"]Windows['"]\s*&&\s*(.+?)\s*\|\|\s*(.*)/i);
     if (winTrue) return (winTrue[2] ?? "").replace(/^['"]|['"]$/g, "");
@@ -150,19 +173,44 @@ function subst(text: string, inputs: Record<string, string>, ctx: SubstContext =
  * Returns false only when the condition definitely evaluates to false/falsy.
  * Defaults to true (include the step) when uncertain.
  */
-function evalCondition(condition: string, ctx: SubstContext): boolean {
+function evalCondition(condition: string, ctx: SubstContext, inputs: Record<string, string> = {}): boolean {
   const c = condition.trim();
 
   // Unwrap ${{ }} if present
   const inner = c.replace(/^\$\{\{\s*|\s*\}\}$/g, "").trim();
 
+  // Logical AND: A && B — both must be true
+  if (inner.includes("&&") && !inner.includes("||")) {
+    const parts = inner.split("&&").map((s) => s.trim());
+    return parts.every((p) => evalCondition(p, ctx, inputs));
+  }
+
   // Logical NOT: !expr
   if (inner.startsWith("!")) {
-    return !evalCondition(inner.slice(1).trim(), ctx);
+    return !evalCondition(inner.slice(1).trim(), ctx, inputs);
   }
 
   // Windows-only checks
   if (/runner\.os\s*==\s*['"]Windows['"]/i.test(inner)) return false;
+
+  // inputs.X (truthiness) — used in composite action steps
+  const inputsVar = inner.match(/^inputs\.([a-zA-Z0-9_-]+)$/);
+  if (inputsVar) {
+    const val = inputs[inputsVar[1]] ?? "";
+    return !!val && val !== "" && val !== "false" && val !== "0";
+  }
+
+  // inputs.X == 'value'
+  const inputsEq = inner.match(/^inputs\.([a-zA-Z0-9_-]+)\s*==\s*['"]([^'"]*)['"]\s*$/);
+  if (inputsEq) {
+    return (inputs[inputsEq[1]] ?? "") === inputsEq[2];
+  }
+
+  // inputs.X != 'value'
+  const inputsNe = inner.match(/^inputs\.([a-zA-Z0-9_-]+)\s*!=\s*['"]([^'"]*)['"]\s*$/);
+  if (inputsNe) {
+    return (inputs[inputsNe[1]] ?? "") !== inputsNe[2];
+  }
 
   // matrix.X (truthiness)
   const matrixVar = inner.match(/^matrix\.([a-zA-Z0-9_]+)$/);
@@ -185,7 +233,7 @@ function evalCondition(condition: string, ctx: SubstContext): boolean {
   }
 
   // runner.os == 'X' type checks that we can resolve
-  const resolvedCond = subst(`\${{ ${inner} }}`, {}, ctx);
+  const resolvedCond = subst(`\${{ ${inner} }}`, inputs, ctx);
   if (resolvedCond === "" || resolvedCond === "false" || resolvedCond === "0") return false;
 
   return true; // default: include
@@ -229,8 +277,8 @@ function inlineComposite(action: ActionYaml, withInputs: Record<string, unknown>
   for (const step of steps) {
     if (!step.run) continue;
 
-    // Skip steps whose condition evaluates to false
-    if (step.if != null && !evalCondition(String(step.if), ctx)) continue;
+    // Skip steps whose condition evaluates to false (pass inputs for composite action if: checks)
+    if (step.if != null && !evalCondition(String(step.if), ctx, inputs)) continue;
 
     // Step-level env vars
     for (const [k, v] of Object.entries(step.env ?? {})) {
@@ -265,10 +313,10 @@ function inlineComposite(action: ActionYaml, withInputs: Record<string, unknown>
 
 // ─── Step resolution ──────────────────────────────────────────────────────────
 
-async function resolveStep(step: RawStep, ctx: SubstContext): Promise<string | null> {
+async function resolveStep(step: RawStep, ctx: SubstContext, repoRoot?: string): Promise<string | null> {
   if (!step.uses) return null;
 
-  const action = await fetchAction(step.uses);
+  const action = await fetchAction(step.uses, repoRoot);
   if (!action) return null;                       // network failure → comment
   if (action.runs.using !== "composite") return null; // JS/Docker → comment
 
@@ -277,14 +325,35 @@ async function resolveStep(step: RawStep, ctx: SubstContext): Promise<string | n
 
 // ─── Job script assembly ──────────────────────────────────────────────────────
 
-async function jobScript(job: RawJob, ctx: SubstContext): Promise<string> {
+function shellQuoteEnv(val: string): string {
+  if (/^[a-zA-Z0-9_./:=@+-]+$/.test(val)) return val;
+  return `'${val.replace(/'/g, "'\\''")}'`;
+}
+
+async function jobScript(job: RawJob, ctx: SubstContext, repoRoot?: string): Promise<string> {
   const parts: string[] = [];
+
+  // Job-level env vars — set for all steps in this job
+  const jobEnvEntries = Object.entries(job.env ?? {});
+  if (jobEnvEntries.length > 0) {
+    for (const [k, v] of jobEnvEntries) {
+      parts.push(`export ${k}=${shellQuoteEnv(subst(String(v), {}, ctx))}`);
+    }
+    parts.push("");
+  }
 
   for (const step of job.steps ?? []) {
     // Evaluate step-level if: condition — skip steps that won't run
     if (step.if != null && !evalCondition(String(step.if), ctx)) continue;
 
     if (step.run) {
+      // Reset shell options from any previous step — GitHub Actions runs each step
+      // in a fresh shell, so set -u/-e/-o pipefail must not bleed between steps.
+      parts.push('{ set +euo pipefail; } 2>/dev/null || true');
+      // Step-level env vars — scoped to this step
+      for (const [k, v] of Object.entries(step.env ?? {})) {
+        parts.push(`export ${k}=${shellQuoteEnv(subst(String(v), {}, ctx))}`);
+      }
       parts.push(subst(step.run.trim(), {}, ctx));
       continue;
     }
@@ -299,7 +368,7 @@ async function jobScript(job: RawJob, ctx: SubstContext): Promise<string> {
       continue;
     }
 
-    const inlined = await resolveStep(step, ctx);
+    const inlined = await resolveStep(step, ctx, repoRoot);
     if (inlined !== null) {
       parts.push(inlined);
     } else {
@@ -313,17 +382,45 @@ async function jobScript(job: RawJob, ctx: SubstContext): Promise<string> {
   }
 
   const script = parts.join("\n");
+  const guards: string[] = [];
 
-  // If the script publishes a GitHub release, skip gracefully when running
-  // locally without auth rather than failing the whole check run.
-  if (/\bgh\s+release\s+(create|edit)\b/.test(script)) {
-    return (
-      '[ -z "${GITHUB_TOKEN:-}" ] && echo "Skipping release: GITHUB_TOKEN not set" && exit 0\n' +
-      script
-    );
+  // Docker compose: if any step's working-directory contains docker-compose files,
+  // skip the whole job when docker is not available (container-based integration tests
+  // cannot run in the inner loop without Docker infrastructure).
+  if (repoRoot) {
+    const needsDocker = (job.steps ?? []).some((step) => {
+      const wd = step["working-directory" as keyof RawStep] as string | undefined;
+      if (!wd) return false;
+      const absWd = resolve(repoRoot, wd);
+      return ["docker-compose.yml", "docker-compose.yaml", "docker-compose.test.yml", "docker-compose.test.yaml"]
+        .some((f) => existsSync(join(absWd, f)));
+    });
+    if (needsDocker) {
+      guards.push('command -v docker >/dev/null 2>&1 || { echo "Skipping: requires Docker (not available in inner loop)"; exit 0; }');
+    }
   }
 
-  return script;
+  // CI artifacts: skip if the job tries to extract a tarball that doesn't exist.
+  // These artifacts are produced by earlier CI jobs and won't be present in the inner loop.
+  const artifactExtract = script.match(/\btar\s+-[a-zA-Z]*x[a-zA-Z]*f\s+["']?(\S+\.tar\.[a-zA-Z]+)["']?/);
+  if (artifactExtract) {
+    const artifactPath = artifactExtract[1]!.replace(/['"]/g, "");
+    if (!artifactPath.startsWith("$")) {
+      guards.push(`[ -f ${artifactPath} ] || { echo "Skipping: ${basename(artifactPath)} not available (CI artifact)"; exit 0; }`);
+    }
+  }
+
+  // GitHub release: skip gracefully without auth.
+  if (/\bgh\s+release\s+(create|edit)\b/.test(script)) {
+    guards.push('[ -z "${GITHUB_TOKEN:-}" ] && echo "Skipping release: GITHUB_TOKEN not set" && exit 0');
+  }
+
+  // AWS: skip gracefully without credentials.
+  if (/\baws\s+(s3|deploy|cloudformation|ecr|ecs|lambda|ssm)\b/.test(script)) {
+    guards.push('[ -z "${AWS_ACCESS_KEY_ID:-}" ] && echo "Skipping deploy: AWS credentials not set" && exit 0');
+  }
+
+  return guards.length > 0 ? guards.join("\n") + "\n" + script : script;
 }
 
 function isSkippable(uses: string): boolean {
@@ -426,7 +523,7 @@ function formatScript(script: string): string {
   return "`" + escaped + "`";
 }
 
-async function generateCircuit(name: string, wf: RawWorkflow): Promise<string | null> {
+async function generateCircuit(name: string, wf: RawWorkflow, repoRoot?: string): Promise<string | null> {
   const levels = computeLevels(wf.jobs);
   if (levels.length === 0) return null;
 
@@ -460,8 +557,10 @@ async function generateCircuit(name: string, wf: RawWorkflow): Promise<string | 
       const jobId = level[0]!;
       const job = wf.jobs[jobId]!;
       const matrix = resolveMatrix(job.strategy);
-      const ctx: SubstContext = { matrix: matrix ?? undefined, env: workflowEnv };
-      const script = await jobScript(job, ctx);
+      const jobEnv: Record<string, string> = {};
+      for (const [k, v] of Object.entries(job.env ?? {})) jobEnv[k] = String(v);
+      const ctx: SubstContext = { matrix: matrix ?? undefined, env: { ...workflowEnv, ...jobEnv } };
+      const script = await jobScript(job, ctx, repoRoot);
       const to = isLast ? "done" : `after-${slug(jobId)}`;
       lines.push(
         `  .transition(${JSON.stringify(slug(jobId))})`,
@@ -476,8 +575,10 @@ async function generateCircuit(name: string, wf: RawWorkflow): Promise<string | 
       for (const jobId of level) {
         const job = wf.jobs[jobId]!;
         const matrix = resolveMatrix(job.strategy);
-        const ctx: SubstContext = { matrix: matrix ?? undefined, env: workflowEnv };
-        const script = await jobScript(job, ctx);
+        const jobEnv: Record<string, string> = {};
+        for (const [k, v] of Object.entries(job.env ?? {})) jobEnv[k] = String(v);
+        const ctx: SubstContext = { matrix: matrix ?? undefined, env: { ...workflowEnv, ...jobEnv } };
+        const script = await jobScript(job, ctx, repoRoot);
         lines.push(`    w => w.transition(${JSON.stringify(slug(jobId))})${script ? `.script(${formatScript(script)})` : `.noop()`},`);
       }
       lines.push(`  ])`, `  .join(${JSON.stringify(to)})`);
@@ -543,7 +644,9 @@ export async function importWorkflows(options: { githubActions?: boolean; file?:
     }
 
     console.log(chalk.dim(`  importing ${basename(src)}...`));
-    const code = await generateCircuit(name, wf);
+    // Repo root is the directory containing the workflow file's grandparent (.github/workflows/ci.yml → repo root)
+    const repoRoot = resolve(dirname(dirname(dirname(src))));
+    const code = await generateCircuit(name, wf, repoRoot);
     if (!code) {
       console.log(chalk.dim(`  skip ${basename(src)}: could not determine job order`));
       continue;
