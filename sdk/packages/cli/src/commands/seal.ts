@@ -15,11 +15,14 @@ import chalk from "chalk";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, readdirSync, statSync } from "node:fs";
 import { join, basename, resolve, dirname } from "node:path";
 import { spawnSync } from "node:child_process";
+import { parse as parseYAML } from "yaml";
+import { runnerCacheKey, runnerCachePath } from "@circuit-breaker/core";
 import { hashFile, hashConcat } from "../lib/hashing";
 import { sealSign, verifySignature } from "../lib/signing";
-import { loadConfig, machineKeyPath, runnersDir, isConfigured } from "../lib/config";
+import { loadConfig, machineKeyPath, isConfigured } from "../lib/config";
 import { openOrCreateGraph, type SealPayload } from "../lib/graph";
 import { s } from "../lib/symbols";
+import { buildSealedRunner, fingerprintNativeRunner, hasSmolvmBinary } from "../lib/smolvm";
 
 const VERSION = "0.1.0";
 const ZERO_HASH = "0".repeat(64);
@@ -32,16 +35,95 @@ function circuitName(circuitPath: string): string {
   return base.split(".")[0] ?? base;
 }
 
-function findMatchingRunner(circuitHash: string): string | null {
-  const dir = runnersDir();
-  if (!existsSync(dir)) return null;
-  const prefix = circuitHash.slice(0, 16);
-  for (const entry of readdirSync(dir)) {
-    if (entry.startsWith(prefix) && entry.endsWith(".smolmachine")) {
-      return join(dir, entry);
+function isSkippableAction(uses: string): boolean {
+  const a = uses.toLowerCase();
+  return (
+    a.startsWith("actions/checkout") ||
+    a.startsWith("actions/cache") ||
+    a.startsWith("actions/upload-artifact") ||
+    a.startsWith("actions/download-artifact")
+  );
+}
+
+function resolveRunsOnImage(runsOn: string | string[]): string {
+  const label = Array.isArray(runsOn) ? runsOn[0] : runsOn;
+  const map: Record<string, string> = {
+    "ubuntu-latest": "ubuntu:24.04",
+    "ubuntu-24.04": "ubuntu:24.04",
+    "ubuntu-22.04": "ubuntu:22.04",
+    "ubuntu-20.04": "ubuntu:20.04",
+  };
+  return map[label] ?? label;
+}
+
+/**
+ * Ensure a runner artifact exists for this circuit and return its hash.
+ *
+ * - GHA (.yml/.yaml): parse image + uses, use runnerCacheKey, build if missing.
+ * - Native (.wf.ts / other): pack the persistent cb-check VM if it exists.
+ */
+async function ensureRunner(
+  circuitPath: string,
+): Promise<{ runnerHash: string; runnerRef: string | null }> {
+  const isGHA = circuitPath.endsWith(".yml") || circuitPath.endsWith(".yaml");
+
+  if (isGHA) {
+    return ensureGHARunner(circuitPath);
+  }
+  return ensureNativeRunner();
+}
+
+async function ensureGHARunner(
+  circuitPath: string,
+): Promise<{ runnerHash: string; runnerRef: string | null }> {
+  let image = "ubuntu:24.04";
+  let uses: { uses: string; with?: Record<string, unknown> }[] = [];
+
+  try {
+    const wf = parseYAML(readFileSync(circuitPath, "utf-8")) as {
+      jobs?: Record<string, {
+        "runs-on"?: string | string[];
+        steps?: Array<{ uses?: string; with?: Record<string, unknown> }>;
+      }>;
+    };
+    const firstJob = Object.values(wf.jobs ?? {})[0];
+    if (firstJob) {
+      image = resolveRunsOnImage(firstJob["runs-on"] ?? "ubuntu-latest");
+      uses = (firstJob.steps ?? [])
+        .filter((step) => step.uses && !isSkippableAction(step.uses))
+        .map((step) => ({ uses: step.uses!, with: step.with }));
+    }
+  } catch {
+    return { runnerHash: ZERO_HASH, runnerRef: null };
+  }
+
+  const cacheKey = runnerCacheKey(image, uses);
+  const cachePath = runnerCachePath(cacheKey);
+
+  if (!existsSync(cachePath)) {
+    console.log(chalk.dim("  Runner not cached — building sealed runner..."));
+    const built = await buildSealedRunner(image, uses, cacheKey, cachePath);
+    if (!built) {
+      console.error(chalk.red(`  ${s.cross} Failed to build runner for sealing`));
+      return { runnerHash: ZERO_HASH, runnerRef: null };
     }
   }
-  return null;
+
+  if (existsSync(cachePath)) {
+    return { runnerHash: hashFile(cachePath), runnerRef: cachePath };
+  }
+
+  return { runnerHash: ZERO_HASH, runnerRef: null };
+}
+
+async function ensureNativeRunner(): Promise<{ runnerHash: string; runnerRef: string | null }> {
+  if (!hasSmolvmBinary()) return { runnerHash: ZERO_HASH, runnerRef: null };
+
+  console.log(chalk.dim("  Fingerprinting native runner VM..."));
+  const fingerprint = await fingerprintNativeRunner();
+  if (!fingerprint) return { runnerHash: ZERO_HASH, runnerRef: null };
+
+  return { runnerHash: fingerprint, runnerRef: null };
 }
 
 function findExistingSeal(
@@ -96,14 +178,8 @@ export async function sealCircuit(
   const name = circuitName(absoluteCircuit);
   const circuitHash = hashFile(absoluteCircuit);
 
-  // Find runner artifact for this circuit (may not exist yet)
-  let runnerHash = ZERO_HASH;
-  let runnerRef: string | null = null;
-  const knownRunner = findMatchingRunner(circuitHash);
-  if (knownRunner) {
-    runnerHash = hashFile(knownRunner);
-    runnerRef = knownRunner;
-  }
+  // Ensure runner artifact exists; build/pack if needed
+  const { runnerHash, runnerRef } = await ensureRunner(absoluteCircuit);
 
   const sealHash = hashConcat(circuitHash, runnerHash);
   const prefix = sealHash.slice(0, 12);
