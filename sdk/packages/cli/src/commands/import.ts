@@ -312,7 +312,18 @@ async function jobScript(job: RawJob, ctx: SubstContext): Promise<string> {
     }
   }
 
-  return parts.join("\n");
+  const script = parts.join("\n");
+
+  // If the script publishes a GitHub release, skip gracefully when running
+  // locally without auth rather than failing the whole check run.
+  if (/\bgh\s+release\s+(create|edit)\b/.test(script)) {
+    return (
+      '[ -z "${GITHUB_TOKEN:-}" ] && echo "Skipping release: GITHUB_TOKEN not set" && exit 0\n' +
+      script
+    );
+  }
+
+  return script;
 }
 
 function isSkippable(uses: string): boolean {

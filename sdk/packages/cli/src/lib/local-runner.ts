@@ -68,11 +68,37 @@ function isTerminal(workflow: Workflow, marking: Marking): boolean {
 
 // ─── Action execution ─────────────────────────────────────────────────────────
 
+async function collectStream(
+  stream: ReadableStream<Uint8Array>,
+  onOutput?: (line: string) => void,
+): Promise<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  const chunks: string[] = [];
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const text = decoder.decode(value, { stream: true });
+    chunks.push(text);
+    if (onOutput) {
+      buffer += text;
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) onOutput(line);
+    }
+  }
+  if (onOutput && buffer.trim()) onOutput(buffer);
+  return chunks.join("");
+}
+
 async function execScript(
   script: string,
   cwd: string,
   env?: Record<string, string>,
   shell = "sh",
+  onOutput?: (line: string) => void,
 ): Promise<{ exit_code: number; stdout: string; stderr: string; duration_ms: number }> {
   const start = performance.now();
   const proc = Bun.spawn([shell, "-c", script], {
@@ -83,8 +109,8 @@ async function execScript(
   });
 
   const [stdout, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
+    collectStream(proc.stdout as ReadableStream<Uint8Array>, onOutput),
+    collectStream(proc.stderr as ReadableStream<Uint8Array>, onOutput),
   ]);
   const exit_code = await proc.exited;
   return { exit_code, stdout, stderr, duration_ms: Math.round(performance.now() - start) };
@@ -96,6 +122,7 @@ async function execViaSmolvm(
   script: string,
   machine: string,
   workdir?: string,
+  onOutput?: (line: string) => void,
 ): Promise<{ exit_code: number; stdout: string; stderr: string; duration_ms: number }> {
   const start = performance.now();
   const parts: string[] = [
@@ -106,12 +133,12 @@ async function execViaSmolvm(
   if (workdir) parts.push(`cd ${workdir} || true`);
   parts.push(script);
   const proc = Bun.spawn(
-    ["smolvm", "machine", "exec", "--name", machine, "--", "bash", "-c", parts.join("\n")],
+    ["smolvm", "machine", "exec", "--name", machine, "--stream", "--", "bash", "-c", parts.join("\n")],
     { stdout: "pipe", stderr: "pipe" },
   );
   const [stdout, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
+    collectStream(proc.stdout as ReadableStream<Uint8Array>, onOutput),
+    collectStream(proc.stderr as ReadableStream<Uint8Array>, onOutput),
   ]);
   const exit_code = await proc.exited;
   return { exit_code, stdout, stderr, duration_ms: Math.round(performance.now() - start) };
@@ -126,6 +153,7 @@ export async function runCircuit(
     smolvmWorkdir?: string;
     onStepStart?: (id: string, name: string) => void;
     onStepEnd?: (result: StepResult) => void;
+    onOutput?: (line: string) => void;
   } = {},
 ): Promise<CircuitRunResult> {
   const marking = buildInitialMarking(workflow.places);
@@ -216,8 +244,8 @@ export async function runCircuit(
       // File-based scripts are invoked with the specified runtime.
       const scriptContent = sa.code ?? (sa.file ? `${sa.runtime ?? "bun"} "${sa.file}"` : "");
       const execResult = options.smolvmMachine && scriptContent
-        ? await execViaSmolvm(scriptContent, options.smolvmMachine, options.smolvmWorkdir)
-        : await execScript(scriptContent, source, undefined, "sh");
+        ? await execViaSmolvm(scriptContent, options.smolvmMachine, options.smolvmWorkdir, options.onOutput)
+        : await execScript(scriptContent, source, undefined, "sh", options.onOutput);
       const passed = execResult.exit_code === 0;
       result = {
         id: stepId,

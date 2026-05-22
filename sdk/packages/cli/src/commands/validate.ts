@@ -7,6 +7,7 @@
 import { resolve, extname } from 'path';
 import chalk from 'chalk';
 import { WorkflowSchema, validateWorkflow, visualize, type Workflow } from '@circuit-breaker/core';
+import { s } from "../lib/symbols";
 
 interface ValidateOptions {
   strict?: boolean;
@@ -59,7 +60,7 @@ export async function validate(workflowPath: string, options: ValidateOptions): 
     workflow = await loadWorkflow(workflowPath);
   } catch (error) {
     if (error instanceof Error) {
-      console.error(chalk.red(`✗ Failed to load workflow: ${error.message}`));
+      console.error(chalk.red(`${s.cross} Failed to load workflow: ${error.message}`));
     }
     process.exit(1);
   }
@@ -88,9 +89,9 @@ export async function validate(workflowPath: string, options: ValidateOptions): 
 
   // Print validation results
   if (result.valid) {
-    console.log(chalk.green('✓ Workflow is valid\n'));
+    console.log(chalk.green(`${s.check} Workflow is valid\n`));
   } else {
-    console.log(chalk.red('✗ Workflow validation failed\n'));
+    console.log(chalk.red(`${s.cross} Workflow validation failed\n`));
   }
 
   // Print errors

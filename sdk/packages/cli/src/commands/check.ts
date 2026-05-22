@@ -42,7 +42,7 @@ import {
 } from "@circuit-breaker/core";
 import { hashFile, hashString, hashDirectory, hashConcat, canonicalJSON } from "../lib/hashing";
 import { openOrCreateGraph, findGraphPath, type RunPayload, type TransitionPayload, type RunStatus } from "../lib/graph";
-import { signWithMachineKey, getMachinePubkeyBase64, machineKeyExists } from "../lib/signing";
+import { signWithMachineKey, getMachinePubkeyBase64, machineKeyExists, generateMachineKey } from "../lib/signing";
 import { runCircuit } from "../lib/local-runner";
 import { verifySeal } from "./seal";
 import { loadConfig } from "../lib/config";
@@ -331,7 +331,7 @@ async function execInBuilder(
   // long installs (apt-get, rustup, etc.) instead of staring at a
   // frozen terminal for minutes.
   const proc = Bun.spawn(
-    ["smolvm", "machine", "exec", "--name", vmName, "--", "bash", "-c", script],
+    ["smolvm", "machine", "exec", "--name", vmName, "--stream", "--", "bash", "-c", script],
     { stdout: "pipe", stderr: "pipe" },
   );
 
@@ -409,11 +409,11 @@ async function execInBuilder(
       );
     } else if (exitCode === 0) {
       console.log(
-        `    ${chalk.green(s.check)} ${label} ${chalk.dim(`(${duration_ms}ms)`)}`,
+        `    ${chalk.green(s.check)} ${label} ${chalk.dim(`(${fmtDuration(duration_ms)})`)}`,
       );
     } else {
       console.log(
-        `    ${chalk.red(s.cross)} ${label} (exit code ${exitCode}) ${chalk.dim(`(${duration_ms}ms)`)}`,
+        `    ${chalk.red(s.cross)} ${label} (exit code ${exitCode}) ${chalk.dim(`(${fmtDuration(duration_ms)})`)}`,
       );
     }
   }
@@ -623,7 +623,7 @@ async function buildSealedRunner(
     }
 
     console.log(
-      chalk.green(`    ${s.check} Runner sealed ${chalk.dim(`(${sealDuration}ms)`)}`),
+      chalk.green(`    ${s.check} Runner sealed ${chalk.dim(`(${fmtDuration(sealDuration)})`)}`),
     );
     console.log(chalk.dim(`    Cached at: ${cachePath}`));
     return true;
@@ -736,6 +736,7 @@ async function execRunStep(
       "exec",
       "--name",
       RUNNER_VM,
+      "--stream",
       "--",
       "bash",
       "-c",
@@ -846,6 +847,14 @@ async function execLocally(
 }
 
 // ============ Helpers ============
+
+function fmtDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  const m = Math.floor(ms / 60_000);
+  const s = Math.round((ms % 60_000) / 1000);
+  return s === 0 ? `${m}m` : `${m}m${s}s`;
+}
 
 function slugify(s: string): string {
   return (
@@ -1127,6 +1136,13 @@ async function checkNativeCircuits(
 
   if (circuitPaths.length === 0) return null;
 
+  // Auto-generate machine identity key on first run so graph writes work
+  if (!machineKeyExists()) {
+    try {
+      generateMachineKey();
+    } catch { /* non-fatal — graph writes will be skipped */ }
+  }
+
   // Boot smolvm for native circuit execution if available
   let smolvmMachine: string | undefined;
   let smolvmWorkdir: string | undefined;
@@ -1161,6 +1177,10 @@ async function checkNativeCircuits(
       }
       smolvmMachine = RUNNER_VM;
       smolvmWorkdir = `/projects/${basename(resolve(source))}`;
+      // Stop the VM on any exit (clean or error) so RAM is freed
+      process.on("exit", () => {
+        Bun.spawnSync(["smolvm", "machine", "stop", "--name", RUNNER_VM]);
+      });
     }
   }
 
@@ -1228,17 +1248,19 @@ async function checkNativeCircuits(
       fromStep: options.from,
       smolvmMachine,
       smolvmWorkdir,
-      onStepStart: (id) => process.stdout.write(chalk.blue(`  ${s.play} ${id}...`)),
+      onStepStart: (id) => {
+        process.stdout.write(chalk.blue(`  ${s.play} ${id}...\n`));
+      },
+      onOutput: (line) => {
+        if (line.trim()) console.log(chalk.dim(`    ${line}`));
+      },
       onStepEnd: (result) => {
         if (result.status === "passed") {
-          console.log(`\r  ${chalk.green(s.check)} ${result.id} ${chalk.dim(`(${result.duration_ms}ms)`)}`);
+          console.log(`  ${chalk.green(s.check)} ${result.id} ${chalk.dim(`(${result.duration_ms}ms)`)}`);
         } else if (result.status === "failed") {
-          console.log(`\r  ${chalk.red(s.cross)} ${result.id} ${chalk.dim(`(${result.duration_ms}ms)`)}`);
-          // Show stdout (tool output like format diffs) before stderr (setup messages)
-          const out = [result.output, result.error].filter((s) => s.trim()).join("\n").trim();
-          if (out) for (const line of out.split("\n").slice(-15)) console.log(chalk.red(`    ${line}`));
+          console.log(`  ${chalk.red(s.cross)} ${result.id} ${chalk.dim(`(${result.duration_ms}ms)`)}`);
         } else {
-          console.log(`\r  ${chalk.dim(s.skip)} ${result.id} (skipped)`);
+          console.log(`  ${chalk.dim(s.skip)} ${result.id} (skipped)`);
         }
       },
     });
@@ -1303,7 +1325,7 @@ async function checkNativeCircuits(
     allResults.push(checkResult);
 
     if (runResult.status === "passed") {
-      console.log(chalk.green(`  ${s.check} ${circuitName} passed ${chalk.dim(`(${totalDuration}ms)`)}`));
+      console.log(chalk.green(`  ${s.check} ${circuitName} passed ${chalk.dim(`(${fmtDuration(totalDuration)})`)}`));
     } else {
       console.log(chalk.red(`  ${s.cross} ${circuitName} failed at '${runResult.failed_step}'`));
       if (!options.from) {
@@ -1312,6 +1334,8 @@ async function checkNativeCircuits(
     }
     console.log();
   }
+
+  if (smolvmMachine) await stopVM(smolvmMachine);
 
   return allResults;
 }
@@ -1335,7 +1359,7 @@ export async function check(
       if (!options.json) {
         console.log(chalk.dim("-".repeat(50)));
         if (allPassed) {
-          console.log(chalk.green(`${s.check} All checks passed ${chalk.dim(`(${totalDuration}ms)`)}`));
+          console.log(chalk.green(`${s.check} All checks passed ${chalk.dim(`(${fmtDuration(totalDuration)})`)}`));
         } else {
           const failed = nativeResults.filter((r) => r.status === "failed");
           console.log(chalk.red(`${s.cross} ${failed.length} of ${nativeResults.length} circuit(s) failed`));
@@ -1627,7 +1651,7 @@ export async function check(
       if (wfPassed) {
         console.log(
           chalk.green(
-            `  ${s.check} ${wfName} passed ${chalk.dim(`(${totalDuration}ms)`)}`,
+            `  ${s.check} ${wfName} passed ${chalk.dim(`(${fmtDuration(totalDuration)})`)}`,
           ),
         );
       } else {
@@ -1771,7 +1795,7 @@ export async function check(
 
     console.log(
       chalk.green(
-        `  ${s.check} Runner ${reused ? "reused" : "ready"} ${chalk.dim(`(${bootDuration}ms)`)}`,
+        `  ${s.check} Runner ${reused ? "reused" : "ready"} ${chalk.dim(`(${fmtDuration(bootDuration)})`)}`,
       ),
     );
     console.log(chalk.dim(`  Working directory: ${projectWorkdir}`));
@@ -1905,13 +1929,13 @@ export async function check(
     if (wfPassed) {
       console.log(
         chalk.green(
-          `  ${s.check} ${wfName} passed ${chalk.dim(`(${totalDuration}ms)`)}`,
+          `  ${s.check} ${wfName} passed ${chalk.dim(`(${fmtDuration(totalDuration)})`)}`,
         ),
       );
     } else {
       console.log(
         chalk.red(
-          `  ${s.cross} ${wfName} failed at step '${failedStep?.id}' ${chalk.dim(`(${totalDuration}ms)`)}`,
+          `  ${s.cross} ${wfName} failed at step '${failedStep?.id}' ${chalk.dim(`(${fmtDuration(totalDuration)})`)}`,
         ),
       );
       if (!options.from) {
@@ -1968,7 +1992,7 @@ export async function check(
     console.log(chalk.dim("-".repeat(50)));
     if (allPassed) {
       console.log(
-        chalk.green(`${s.check} All checks passed ${chalk.dim(`(${totalDuration}ms)`)}`),
+        chalk.green(`${s.check} All checks passed ${chalk.dim(`(${fmtDuration(totalDuration)})`)}`),
       );
     } else {
       const failed = allResults.filter((r) => r.status === "failed");
