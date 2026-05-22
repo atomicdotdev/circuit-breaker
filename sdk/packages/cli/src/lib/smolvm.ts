@@ -3,7 +3,7 @@
  * `cb check` (GHA circuits) and `cb seal` (runner ensurement).
  */
 import chalk from "chalk";
-import { existsSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import {
   BASELINE_INSTALL_STEPS,
@@ -322,12 +322,13 @@ export async function buildSealedRunner(
 // ─── Native runner pack ───────────────────────────────────────────────────────
 
 /**
- * Fingerprint the native runner VM (cb-check) by querying its installed
- * package state rather than packing the whole disk image.
+ * Fingerprint the native runner VM (cb-check) by stat-ing its writable
+ * overlay layer on the host filesystem.
  *
- * Packing would create a multi-GB archive and hits smolvm's 4 GB cap once the
- * VM has nvm + Node + other tooling installed.  A hash of the package manifest
- * is just as effective for detecting runner changes.
+ * `smolvm machine data-dir <name>` returns the VM's on-disk directory.
+ * The `overlay.raw` file there is the copy-on-write layer that accumulates
+ * every `apt install` / `npm install` / etc.  Hashing its mtime + size is
+ * instant and detects any mutation without touching the 10–30 GB raw files.
  *
  * Returns a stable hex hash, or null if the VM doesn't exist.
  */
@@ -337,28 +338,19 @@ export async function fingerprintNativeRunner(): Promise<string | null> {
   const vmState = await getVmState(RUNNER_VM);
   if (!vmState) return null;
 
-  const wasRunning = vmState === "running";
-  if (!wasRunning) {
-    const start = await smolvm(["machine", "start", "--name", RUNNER_VM]);
-    if (start.exitCode !== 0) return null;
+  const dataDir = Bun.spawnSync(["smolvm", "machine", "data-dir", RUNNER_VM], {
+    stdout: "pipe", stderr: "pipe",
+  });
+  if (dataDir.exitCode !== 0) return null;
+
+  const dir = dataDir.stdout.toString().trim();
+  const overlayPath = join(dir, "overlay.raw");
+  if (!existsSync(overlayPath)) return null;
+
+  try {
+    const st = statSync(overlayPath);
+    return hashString(`${st.size}:${st.mtimeMs}`);
+  } catch {
+    return null;
   }
-
-  // Collect a lightweight fingerprint: dpkg manifest + key tool versions
-  const fingerprint = await smolvm([
-    "machine", "exec", "--name", RUNNER_VM, "--", "bash", "-c",
-    [
-      "dpkg-query -W -f='${Package} ${Version}\\n' 2>/dev/null | sort",
-      '. "$HOME/.nvm/nvm.sh" 2>/dev/null; node --version 2>/dev/null || true',
-      '. "$HOME/.nvm/nvm.sh" 2>/dev/null; nvm --version 2>/dev/null || true',
-      "rustup --version 2>/dev/null || true",
-      "gh --version 2>/dev/null | head -1 || true",
-    ].join(" && "),
-  ], { timeout: 30_000 });
-
-  if (!wasRunning) {
-    await smolvm(["machine", "stop", "--name", RUNNER_VM]);
-  }
-
-  if (fingerprint.exitCode !== 0) return null;
-  return hashString(fingerprint.stdout);
 }
