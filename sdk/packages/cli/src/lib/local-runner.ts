@@ -101,7 +101,7 @@ async function execScript(
   onOutput?: (line: string) => void,
 ): Promise<{ exit_code: number; stdout: string; stderr: string; duration_ms: number }> {
   const start = performance.now();
-  const proc = Bun.spawn([shell, "-c", script], {
+  const proc = Bun.spawn([shell, "-e", "-c", script], {
     cwd,
     env: { ...process.env, ...env },
     stdout: "pipe",
@@ -126,6 +126,7 @@ async function execViaSmolvm(
 ): Promise<{ exit_code: number; stdout: string; stderr: string; duration_ms: number }> {
   const start = performance.now();
   const parts: string[] = [
+    "set -e",
     // Source common env files to get rustup/cargo/etc. in PATH for non-login shells
     '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env" || true',
     '[ -f /etc/profile ] && . /etc/profile 2>/dev/null || true',
