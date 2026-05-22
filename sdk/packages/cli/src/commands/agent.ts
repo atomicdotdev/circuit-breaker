@@ -1,54 +1,37 @@
 /**
- * `cb agent install` — inject Claude Code stop hooks into the current project.
+ * `cb agent install` — write CLAUDE.md instructions so agents run `cb check`
+ * before completing a turn.
  *
- * Writes:
- *   .claude/hooks/cb-check.sh   — stop hook script
- *   .claude/settings.json       — registers the hook (merges if file exists)
- *
- * Exit code 2 from the hook blocks Claude from completing a turn so it must
- * fix failures before handing control back to the user.
+ * Writes (or merges into) CLAUDE.md at the project root. The agent reads this
+ * file and is required to run `cb check` as a Bash tool call and see
+ * "All checks passed" before handing control back to the user.
  */
 import type { Command } from "commander";
 import chalk from "chalk";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { s } from "../lib/symbols";
 
-const HOOK_SCRIPT = `#!/usr/bin/env bash
-# Claude Code Stop hook — runs cb check before handing control back to the user.
-# Exit 2 blocks completion and shows output to Claude so it can fix failures.
-# Exit 0 allows normal completion.
-#
-# Claude Code reads stdout for the blocking feedback shown to the model.
-# We tee to stderr as well so the output is visible in the terminal.
+const CLAUDE_MD_SECTION = `
+## Before finishing any turn
 
-set -uo pipefail
+You MUST run \`cb check\` as a Bash tool call and it MUST show "All checks passed" before you complete your turn.
 
-cd "$(dirname "$0")/../.."
+If \`cb check\` fails:
+1. Fix the reported errors
+2. Run \`cb check\` again (full run, no \`--from\`)
+3. Only complete the turn once it passes
 
-# Only run if .cb circuits exist
-if [ ! -d ".cb/circuits" ]; then
-  exit 0
-fi
+If you fixed a specific step and want to skip earlier passing steps, use:
 
-echo ""
-echo "╔══════════════════════════════════════╗"
-echo "║  Running verification: cb check      ║"
-echo "╚══════════════════════════════════════╝"
-echo ""
+\`\`\`bash
+cb check --from <step-id>
+\`\`\`
 
-cb check 2>&1 | tee /dev/stderr
-exit_code=\${PIPESTATUS[0]}
-
-echo ""
-if [ "\$exit_code" -eq 0 ]; then
-  echo "✓ cb check passed"
-else
-  echo "✗ cb check failed — fix the issues above before completing."
-  echo "  To resume from the failed step: cb check --from <step-id>"
-  exit 2
-fi
+But when using \`--from\`, you must still verify the full run passes before finishing.
 `;
+
+const SENTINEL = "You MUST run `cb check`";
 
 async function installAgent(options: { force?: boolean; source?: string }): Promise<void> {
   const source = resolve(options.source ?? ".");
@@ -59,60 +42,30 @@ async function installAgent(options: { force?: boolean; source?: string }): Prom
     process.exit(1);
   }
 
-  const claudeDir = join(source, ".claude");
-  const hooksDir = join(claudeDir, "hooks");
-  const hookScript = join(hooksDir, "cb-check.sh");
-  const settingsFile = join(claudeDir, "settings.json");
+  const claudeMd = join(source, "CLAUDE.md");
 
-  // ── Create directories ────────────────────────────────────────────────────
-  mkdirSync(hooksDir, { recursive: true });
-
-  // ── Write hook script ─────────────────────────────────────────────────────
-  if (existsSync(hookScript) && !options.force) {
-    console.log(chalk.dim(`  ${s.skip} .claude/hooks/cb-check.sh already exists (use --force to overwrite)`));
-  } else {
-    writeFileSync(hookScript, HOOK_SCRIPT, "utf-8");
-    chmodSync(hookScript, 0o755);
-    console.log(chalk.green(`  ${s.check} .claude/hooks/cb-check.sh`));
-  }
-
-  // ── Merge settings.json ───────────────────────────────────────────────────
-  let settings: Record<string, unknown> = {};
-  if (existsSync(settingsFile)) {
-    try {
-      settings = JSON.parse(readFileSync(settingsFile, "utf-8"));
-    } catch {
-      console.error(chalk.red(`  ${s.cross} Could not parse existing .claude/settings.json`));
-      process.exit(1);
+  if (existsSync(claudeMd)) {
+    const existing = readFileSync(claudeMd, "utf-8");
+    if (existing.includes(SENTINEL) && !options.force) {
+      console.log(chalk.dim(`  ${s.skip} CLAUDE.md already has cb check instructions (use --force to overwrite)`));
+    } else {
+      const updated = existing.includes(SENTINEL)
+        ? existing.replace(/\n## Before finishing any turn[\s\S]*?(?=\n## |\n*$)/, CLAUDE_MD_SECTION)
+        : existing.trimEnd() + "\n" + CLAUDE_MD_SECTION;
+      writeFileSync(claudeMd, updated, "utf-8");
+      console.log(chalk.green(`  ${s.check} CLAUDE.md (merged)`));
     }
-  }
-
-  // Ensure hooks.Stop array exists
-  if (!settings.hooks) settings.hooks = {};
-  const hooks = settings.hooks as Record<string, unknown[]>;
-  if (!hooks.Stop) hooks.Stop = [];
-  const stopHooks = hooks.Stop as Array<{ matcher: string; hooks: unknown[] }>;
-
-  const checkEntry = { matcher: "", hooks: [{ type: "command", command: "bash .claude/hooks/cb-check.sh" }] };
-
-  const alreadyHasCheck = stopHooks.some((g) =>
-    (g.hooks as Array<{ command?: string }>).some((h) => h.command === "bash .claude/hooks/cb-check.sh"),
-  );
-
-  if (alreadyHasCheck && !options.force) {
-    console.log(chalk.dim(`  ${s.skip} .claude/settings.json already has cb hooks`));
   } else {
-    if (!alreadyHasCheck) stopHooks.push(checkEntry);
-    writeFileSync(settingsFile, JSON.stringify(settings, null, 2) + "\n", "utf-8");
-    console.log(chalk.green(`  ${s.check} .claude/settings.json`));
+    writeFileSync(claudeMd, `# CLAUDE.md\n${CLAUDE_MD_SECTION}`, "utf-8");
+    console.log(chalk.green(`  ${s.check} CLAUDE.md`));
   }
 
   console.log();
-  console.log(chalk.bold("Agent hooks installed."));
+  console.log(chalk.bold("Agent instructions installed."));
   console.log(chalk.dim("  Claude Code will run `cb check` before completing each turn."));
-  console.log(chalk.dim("  On failure, Claude sees the output and must fix it before continuing."));
+  console.log(chalk.dim("  On failure, Claude must fix errors and re-run before finishing."));
   console.log();
-  console.log(chalk.dim("  Tip: commit .claude/ to share hooks with your team."));
+  console.log(chalk.dim("  Tip: commit CLAUDE.md to share instructions with your team."));
 }
 
 export function registerAgentCommand(program: Command): void {
@@ -122,8 +75,8 @@ export function registerAgentCommand(program: Command): void {
 
   agent
     .command("install")
-    .description("Install cb check stop hooks into .claude/ for the current project")
-    .option("-f, --force", "Overwrite existing hook files")
+    .description("Write CLAUDE.md instructions so agents run cb check before completing a turn")
+    .option("-f, --force", "Overwrite existing cb check section")
     .option("-s, --source <path>", "Project root (default: current directory)", ".")
     .action(installAgent);
 }
