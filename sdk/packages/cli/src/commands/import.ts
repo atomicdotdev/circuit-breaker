@@ -37,6 +37,8 @@ interface RawJob {
     "fail-fast"?: boolean;
   };
   env?: Record<string, unknown>;
+  uses?: string;          // job-level reusable workflow call
+  with?: Record<string, unknown>;
 }
 
 interface RawWorkflow {
@@ -103,6 +105,7 @@ async function fetchAction(uses: string, repoRoot?: string): Promise<ActionYaml 
 interface SubstContext {
   matrix?: Record<string, string>;
   env?: Record<string, string>;
+  workflowInputs?: Record<string, string>; // resolved inputs from a workflow_call caller
 }
 
 // ─── Expression substitution ─────────────────────────────────────────────────
@@ -330,21 +333,90 @@ function shellQuoteEnv(val: string): string {
   return `'${val.replace(/'/g, "'\\''")}'`;
 }
 
+/**
+ * Inline all jobs from a reusable workflow (job-level `uses: ./path/to/workflow.yml`).
+ * The caller's `with:` values become `inputs.X` substitutions in the called workflow.
+ * Jobs are run sequentially (respecting their dependency order) within a single script.
+ */
+async function inlineReusableWorkflow(
+  uses: string,
+  withInputs: Record<string, unknown>,
+  parentCtx: SubstContext,
+  repoRoot?: string,
+): Promise<string> {
+  // Only local workflow files are supported
+  if (!uses.startsWith("./") && !uses.startsWith("../")) return "";
+  if (!repoRoot) return "";
+
+  const workflowPath = join(repoRoot, uses);
+  if (!existsSync(workflowPath)) return "";
+
+  let wf: RawWorkflow;
+  try {
+    wf = parseYAML(readFileSync(workflowPath, "utf-8")) as RawWorkflow;
+  } catch {
+    return "";
+  }
+
+  if (!wf?.jobs || Object.keys(wf.jobs).length === 0) return "";
+
+  // Resolve caller's with: values using parent context
+  const resolvedInputs: Record<string, string> = {};
+  for (const [k, v] of Object.entries(withInputs)) {
+    resolvedInputs[k] = subst(String(v), parentCtx.workflowInputs ?? {}, parentCtx);
+  }
+
+  // Build context for the called workflow: its own env + the resolved inputs
+  const calledEnv: Record<string, string> = {};
+  for (const [k, v] of Object.entries(wf.env ?? {})) calledEnv[k] = String(v);
+  const calledCtx: SubstContext = {
+    env: { ...parentCtx.env, ...calledEnv },
+    workflowInputs: resolvedInputs,
+  };
+
+  // Generate scripts for each job in dependency order, concatenated
+  const levels = computeLevels(wf.jobs);
+  const scripts: string[] = [];
+  for (const level of levels) {
+    for (const jobId of level) {
+      const job = wf.jobs[jobId]!;
+      const matrix = resolveMatrix(job.strategy);
+      const jobEnv: Record<string, string> = {};
+      for (const [k, v] of Object.entries(job.env ?? {})) jobEnv[k] = String(v);
+      const ctx: SubstContext = {
+        ...calledCtx,
+        matrix: matrix ?? undefined,
+        env: { ...calledCtx.env, ...jobEnv },
+      };
+      const script = await jobScript(job, ctx, repoRoot);
+      if (script) scripts.push(script);
+    }
+  }
+
+  return scripts.join("\n");
+}
+
 async function jobScript(job: RawJob, ctx: SubstContext, repoRoot?: string): Promise<string> {
+  // Job-level reusable workflow: inline all jobs from the called workflow file.
+  if (job.uses && !job.steps) {
+    return inlineReusableWorkflow(job.uses, job.with ?? {}, ctx, repoRoot);
+  }
+
+  const inputs = ctx.workflowInputs ?? {};
   const parts: string[] = [];
 
   // Job-level env vars — set for all steps in this job
   const jobEnvEntries = Object.entries(job.env ?? {});
   if (jobEnvEntries.length > 0) {
     for (const [k, v] of jobEnvEntries) {
-      parts.push(`export ${k}=${shellQuoteEnv(subst(String(v), {}, ctx))}`);
+      parts.push(`export ${k}=${shellQuoteEnv(subst(String(v), inputs, ctx))}`);
     }
     parts.push("");
   }
 
   for (const step of job.steps ?? []) {
     // Evaluate step-level if: condition — skip steps that won't run
-    if (step.if != null && !evalCondition(String(step.if), ctx)) continue;
+    if (step.if != null && !evalCondition(String(step.if), ctx, inputs)) continue;
 
     if (step.run) {
       // Reset shell options from any previous step — GitHub Actions runs each step
@@ -352,9 +424,9 @@ async function jobScript(job: RawJob, ctx: SubstContext, repoRoot?: string): Pro
       parts.push('{ set +euo pipefail; } 2>/dev/null || true');
       // Step-level env vars — scoped to this step
       for (const [k, v] of Object.entries(step.env ?? {})) {
-        parts.push(`export ${k}=${shellQuoteEnv(subst(String(v), {}, ctx))}`);
+        parts.push(`export ${k}=${shellQuoteEnv(subst(String(v), inputs, ctx))}`);
       }
-      parts.push(subst(step.run.trim(), {}, ctx));
+      parts.push(subst(step.run.trim(), inputs, ctx));
       continue;
     }
     if (!step.uses) continue;
