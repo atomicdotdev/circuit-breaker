@@ -66,64 +66,84 @@ export async function cbStatus(): Promise<void> {
     return;
   }
 
-  // ── Last run ──────────────────────────────────────────────────────────────
-  const last = graph.getLatestRun();
-  if (!last) {
+  // ── Last run per circuit ──────────────────────────────────────────────────
+  // Show the latest run for each active seal individually so a passing circuit
+  // never masks a failing one. getLatestRun() with no args returns the global
+  // most-recent row, which is misleading when multiple circuits ran and the
+  // last one happened to pass.
+  const sealsDir = join(cbRoot, ".cb", "seals");
+  const sealDirs = existsSync(sealsDir)
+    ? readdirSync(sealsDir).filter((d) => existsSync(join(sealsDir, d, "manifest.json")))
+    : [];
+
+  if (sealDirs.length === 0) {
     graph.close();
     console.log(chalk.dim("  No runs recorded yet. Run `cb check` to get started."));
     console.log();
     return;
   }
 
-  const transitions = graph.getTransitionsByRun(last.nodeId);
   const chain = graph.getRunChain(1);
-  graph.close();
 
-  const p: RunPayload = last.payload;
-  const started = new Date(p.started_at);
-  const finished = new Date(p.finished_at);
-  const durationMs = finished.getTime() - started.getTime();
-  const passed = transitions.filter((t) => t.payload.status === "Passed").length;
-  const total = transitions.length;
+  let anyRun = false;
+  let anyFailed = false;
 
-  console.log(chalk.bold("Last Run:"));
-  console.log(`  Status:   ${statusBadge(p.status)}  ${chalk.dim(`(${formatDuration(durationMs)})`)}`);
-  console.log(`  Circuit:  ${p.seal_id}`);
-  console.log(`  Run ID:   ${last.nodeId.slice(0, 12)}`);
-  console.log(`  Input:    sha256:${p.input_hash.slice(0, 16)}...`);
-  console.log(`  When:     ${started.toISOString()}`);
-  console.log(`  Steps:    ${passed}/${total} passed`);
+  console.log(chalk.bold("Last Run (per circuit):"));
+  console.log();
 
-  if (transitions.length > 0) {
-    console.log();
-    for (const t of transitions) {
-      const icon = t.payload.status === "Passed"
-        ? chalk.green(`  ${s.check}`)
-        : t.payload.status === "Failed"
-          ? chalk.red(`  ${s.cross}`)
-          : chalk.dim(`  ${s.skip}`);
-      console.log(`${icon} ${t.payload.name.padEnd(28)} ${chalk.dim(formatDuration(t.payload.duration_ms))}`);
+  for (const dir of sealDirs.slice(0, 10)) {
+    let manifest: Record<string, string>;
+    try {
+      manifest = JSON.parse(readFileSync(join(sealsDir, dir, "manifest.json"), "utf-8"));
+    } catch { continue; }
+
+    const last = graph.getLatestRun(manifest.seal_hash);
+    if (!last) {
+      console.log(`  ${chalk.dim(`cb/${manifest.circuit_name}:${dir}`)}  ${chalk.dim("no runs yet")}`);
+      continue;
+    }
+
+    anyRun = true;
+    const p: RunPayload = last.payload;
+    const started = new Date(p.started_at);
+    const finished = new Date(p.finished_at);
+    const durationMs = finished.getTime() - started.getTime();
+    const transitions = graph.getTransitionsByRun(last.nodeId);
+    const passed = transitions.filter((t) => t.payload.status === "Passed").length;
+    const total = transitions.length;
+
+    if (p.status === "Failed") anyFailed = true;
+
+    console.log(`  ${statusBadge(p.status)}  cb/${manifest.circuit_name}:${dir}  ${chalk.dim(`(${formatDuration(durationMs)})`)}`);
+    console.log(`  ${chalk.dim(`Run: ${last.nodeId.slice(0, 12)}  Steps: ${passed}/${total}  When: ${started.toISOString()}`)}`);
+
+    if (transitions.length > 0) {
+      console.log();
+      for (const t of transitions) {
+        const icon = t.payload.status === "Passed"
+          ? chalk.green(`    ${s.check}`)
+          : t.payload.status === "Failed"
+            ? chalk.red(`    ${s.cross}`)
+            : chalk.dim(`    ${s.skip}`);
+        console.log(`${icon} ${t.payload.name.padEnd(26)} ${chalk.dim(formatDuration(t.payload.duration_ms))}`);
+      }
+      console.log();
     }
   }
 
-  // ── Active seals ──────────────────────────────────────────────────────────
-  const sealsDir = join(cbRoot, ".cb", "seals");
-  if (existsSync(sealsDir)) {
-    const sealDirs = readdirSync(sealsDir).filter((d) =>
-      existsSync(join(sealsDir, d, "manifest.json")),
-    );
-    if (sealDirs.length > 0) {
-      console.log();
-      console.log(chalk.bold("Active Seals:"));
-      for (const dir of sealDirs.slice(0, 10)) {
-        try {
-          const manifest = JSON.parse(readFileSync(join(sealsDir, dir, "manifest.json"), "utf-8"));
-          console.log(
-            `  cb/${manifest.circuit_name}:${dir}  ${chalk.dim(manifest.sealed_at?.slice(0, 10) ?? "?")}`,
-          );
-        } catch { /* skip */ }
-      }
-    }
+  graph.close();
+
+  if (!anyRun) {
+    console.log(chalk.dim("  No runs recorded yet. Run `cb check` to get started."));
+    console.log();
+    return;
+  }
+
+  console.log(chalk.dim("-".repeat(48)));
+  if (anyFailed) {
+    console.log(chalk.red.bold(`  Overall: FAILED`));
+  } else {
+    console.log(chalk.green.bold(`  Overall: PASSED`));
   }
 
   // ── Merkle root ───────────────────────────────────────────────────────────

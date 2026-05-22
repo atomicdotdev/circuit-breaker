@@ -32,6 +32,7 @@ import { registerVerifyCommand } from "./commands/verify-cmd";
 import { registerLogCommand } from "./commands/log-cmd";
 import { registerCbStatusCommand } from "./commands/cb-status";
 import { registerImportCommand } from "./commands/import";
+import { registerAgentCommand } from "./commands/agent";
 import { startTUI } from "./tui";
 import { s } from "./lib/symbols";
 
@@ -548,6 +549,7 @@ program
 // Inner loop commands — init, import, seal, check, attest, verify, log
 registerInitCommand(program);
 registerImportCommand(program);
+registerAgentCommand(program);
 registerSealCommand(program);
 registerCheckCommand(program);
 registerAttestCommand(program);
