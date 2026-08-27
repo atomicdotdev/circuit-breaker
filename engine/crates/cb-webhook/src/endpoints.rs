@@ -550,6 +550,272 @@ fn get_json_path<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a ser
     Some(current)
 }
 
+// ==================== Pipe Operations ====================
+
+/// Supported pipe operations for template expressions.
+///
+/// Pipe operations transform values extracted from webhook payloads.
+/// They follow Go template syntax: `{{ .field | operation "arg" }}`
+#[derive(Debug, Clone, PartialEq)]
+enum PipeOp {
+    /// Remove a prefix from a string: `trimPrefix "refs/heads/"`
+    TrimPrefix(String),
+    /// Remove a suffix from a string: `trimSuffix ".git"`
+    TrimSuffix(String),
+    /// Convert string to lowercase: `toLower`
+    ToLower,
+    /// Convert string to uppercase: `toUpper`
+    ToUpper,
+    /// Remove leading and trailing whitespace: `trim`
+    Trim,
+    /// Replace all occurrences: `replace "/" "-"`
+    Replace { old: String, new: String },
+    /// Provide default value if empty: `default "fallback"`
+    Default(String),
+    /// Convert value to JSON string: `toJson`
+    ToJson,
+}
+
+/// Parse pipe operations from a pipe expression string.
+///
+/// Handles expressions like:
+/// - `trimPrefix "refs/heads/"`
+/// - `toLower`
+/// - `replace "/" "-"`
+/// - `toLower | trimPrefix "pre"` (chained)
+fn parse_pipe_ops(pipe_expr: &str) -> Vec<PipeOp> {
+    let mut ops = Vec::new();
+
+    // Split on | for chained operations
+    for part in pipe_expr.split('|') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+
+        // Parse operation and arguments
+        if let Some(op) = parse_single_pipe_op(part) {
+            ops.push(op);
+        }
+    }
+
+    ops
+}
+
+/// Parse a single pipe operation.
+///
+/// Handles:
+/// - `trimPrefix "value"` - operation with quoted argument
+/// - `toLower` - operation without arguments
+/// - `replace "old" "new"` - operation with two quoted arguments
+fn parse_single_pipe_op(expr: &str) -> Option<PipeOp> {
+    let expr = expr.trim();
+
+    // Extract operation name and arguments
+    let (op_name, args_str) = if let Some(space_pos) = expr.find(char::is_whitespace) {
+        (&expr[..space_pos], expr[space_pos..].trim())
+    } else {
+        (expr, "")
+    };
+
+    match op_name {
+        "trimPrefix" => {
+            let arg = extract_quoted_arg(args_str)?;
+            Some(PipeOp::TrimPrefix(arg))
+        }
+        "trimSuffix" => {
+            let arg = extract_quoted_arg(args_str)?;
+            Some(PipeOp::TrimSuffix(arg))
+        }
+        "toLower" => Some(PipeOp::ToLower),
+        "toUpper" => Some(PipeOp::ToUpper),
+        "trim" => Some(PipeOp::Trim),
+        "replace" => {
+            let (old, new) = extract_two_quoted_args(args_str)?;
+            Some(PipeOp::Replace { old, new })
+        }
+        "default" => {
+            let arg = extract_quoted_arg(args_str)?;
+            Some(PipeOp::Default(arg))
+        }
+        "toJson" => Some(PipeOp::ToJson),
+        _ => None, // Unknown operation, skip it
+    }
+}
+
+/// Extract a single quoted argument from a string.
+/// Handles both single and double quotes.
+fn extract_quoted_arg(s: &str) -> Option<String> {
+    let s = s.trim();
+
+    if s.starts_with('"') {
+        // Double-quoted string
+        let end = s[1..].find('"')?;
+        Some(s[1..end + 1].to_string())
+    } else if s.starts_with('\'') {
+        // Single-quoted string
+        let end = s[1..].find('\'')?;
+        Some(s[1..end + 1].to_string())
+    } else {
+        // Unquoted - take until whitespace or end
+        let arg = s.split_whitespace().next()?;
+        Some(arg.to_string())
+    }
+}
+
+/// Extract two quoted arguments from a string.
+fn extract_two_quoted_args(s: &str) -> Option<(String, String)> {
+    let s = s.trim();
+
+    // Find first argument
+    let (first_arg, rest) = if s.starts_with('"') {
+        let end = s[1..].find('"')?;
+        (s[1..end + 1].to_string(), s[end + 2..].trim())
+    } else if s.starts_with('\'') {
+        let end = s[1..].find('\'')?;
+        (s[1..end + 1].to_string(), s[end + 2..].trim())
+    } else {
+        return None;
+    };
+
+    // Find second argument
+    let second_arg = extract_quoted_arg(rest)?;
+
+    Some((first_arg, second_arg))
+}
+
+/// Apply pipe operations to a JSON value.
+///
+/// Operations are applied in sequence, with each operation receiving
+/// the output of the previous one.
+fn apply_pipe_ops(mut value: serde_json::Value, ops: &[PipeOp]) -> serde_json::Value {
+    for op in ops {
+        value = apply_single_pipe_op(value, op);
+    }
+    value
+}
+
+/// Apply a single pipe operation to a JSON value.
+///
+/// # Type handling
+///
+/// Pipe operations are designed to be forgiving for webhook processing:
+///
+/// - **String operations** (`trimPrefix`, `trimSuffix`, `toLower`, `toUpper`, `trim`, `replace`):
+///   Only apply to string values. Non-string values pass through unchanged with a warning log.
+///   This is intentional - webhooks should be resilient, and silent pass-through with logging
+///   is preferable to hard failures.
+///
+/// - **Universal operations** (`toJson`, `default`):
+///   Work on any value type. `toJson` serializes any value; `default` handles null/empty.
+fn apply_single_pipe_op(value: serde_json::Value, op: &PipeOp) -> serde_json::Value {
+    match op {
+        PipeOp::TrimPrefix(prefix) => {
+            if let serde_json::Value::String(s) = value {
+                let result = s.strip_prefix(prefix.as_str()).unwrap_or(&s).to_string();
+                serde_json::Value::String(result)
+            } else {
+                tracing::warn!(
+                    op = "trimPrefix",
+                    value_type = value_type_name(&value),
+                    "pipe operation requires string input, passing through unchanged"
+                );
+                value
+            }
+        }
+        PipeOp::TrimSuffix(suffix) => {
+            if let serde_json::Value::String(s) = value {
+                let result = s.strip_suffix(suffix.as_str()).unwrap_or(&s).to_string();
+                serde_json::Value::String(result)
+            } else {
+                tracing::warn!(
+                    op = "trimSuffix",
+                    value_type = value_type_name(&value),
+                    "pipe operation requires string input, passing through unchanged"
+                );
+                value
+            }
+        }
+        PipeOp::ToLower => {
+            if let serde_json::Value::String(s) = value {
+                serde_json::Value::String(s.to_lowercase())
+            } else {
+                tracing::warn!(
+                    op = "toLower",
+                    value_type = value_type_name(&value),
+                    "pipe operation requires string input, passing through unchanged"
+                );
+                value
+            }
+        }
+        PipeOp::ToUpper => {
+            if let serde_json::Value::String(s) = value {
+                serde_json::Value::String(s.to_uppercase())
+            } else {
+                tracing::warn!(
+                    op = "toUpper",
+                    value_type = value_type_name(&value),
+                    "pipe operation requires string input, passing through unchanged"
+                );
+                value
+            }
+        }
+        PipeOp::Trim => {
+            if let serde_json::Value::String(s) = value {
+                serde_json::Value::String(s.trim().to_string())
+            } else {
+                tracing::warn!(
+                    op = "trim",
+                    value_type = value_type_name(&value),
+                    "pipe operation requires string input, passing through unchanged"
+                );
+                value
+            }
+        }
+        PipeOp::Replace { old, new } => {
+            if let serde_json::Value::String(s) = value {
+                serde_json::Value::String(s.replace(old, new))
+            } else {
+                tracing::warn!(
+                    op = "replace",
+                    value_type = value_type_name(&value),
+                    "pipe operation requires string input, passing through unchanged"
+                );
+                value
+            }
+        }
+        // Universal operations - work on any value type
+        PipeOp::Default(default_value) => {
+            match &value {
+                serde_json::Value::Null => serde_json::Value::String(default_value.clone()),
+                serde_json::Value::String(s) if s.is_empty() => {
+                    serde_json::Value::String(default_value.clone())
+                }
+                _ => value,
+            }
+        }
+        PipeOp::ToJson => {
+            // Convert the value to a JSON string representation - works on any type
+            match serde_json::to_string(&value) {
+                Ok(json_str) => serde_json::Value::String(json_str),
+                Err(_) => value,
+            }
+        }
+    }
+}
+
+/// Get a human-readable type name for a JSON value (for logging).
+fn value_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 /// Map inputs from the payload using template expressions.
 fn map_inputs(
     input_mappings: &HashMap<String, String>,
@@ -576,7 +842,7 @@ fn evaluate_template(template: &str, payload: &serde_json::Value) -> Option<serd
         let path = path.strip_prefix('.').unwrap_or(path);
 
         // Handle pipe operations like | trimPrefix
-        let (path, _pipe_ops) = if let Some(pipe_pos) = path.find('|') {
+        let (path, pipe_ops_str) = if let Some(pipe_pos) = path.find('|') {
             (path[..pipe_pos].trim(), Some(&path[pipe_pos + 1..]))
         } else {
             (path, None)
@@ -584,9 +850,15 @@ fn evaluate_template(template: &str, payload: &serde_json::Value) -> Option<serd
 
         let value = get_json_path(payload, path)?;
 
-        // TODO: Apply pipe operations
+        // Apply pipe operations if present
+        let result = if let Some(ops_str) = pipe_ops_str {
+            let ops = parse_pipe_ops(ops_str);
+            apply_pipe_ops(value.clone(), &ops)
+        } else {
+            value.clone()
+        };
 
-        return Some(value.clone());
+        return Some(result);
     }
 
     // Handle direct path references (without {{ }})
@@ -1027,5 +1299,278 @@ mod tests {
             inputs.get("commit"),
             Some(&serde_json::Value::String("abc123".to_string()))
         );
+    }
+
+    // ==================== Pipe Operations Tests ====================
+
+    #[test]
+    fn test_parse_pipe_ops_trim_prefix() {
+        let ops = parse_pipe_ops("trimPrefix \"refs/heads/\"");
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0], PipeOp::TrimPrefix("refs/heads/".to_string()));
+    }
+
+    #[test]
+    fn test_parse_pipe_ops_simple() {
+        let ops = parse_pipe_ops("toLower");
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0], PipeOp::ToLower);
+
+        let ops = parse_pipe_ops("toUpper");
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0], PipeOp::ToUpper);
+
+        let ops = parse_pipe_ops("trim");
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0], PipeOp::Trim);
+
+        let ops = parse_pipe_ops("toJson");
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0], PipeOp::ToJson);
+    }
+
+    #[test]
+    fn test_parse_pipe_ops_replace() {
+        let ops = parse_pipe_ops("replace \"/\" \"-\"");
+        assert_eq!(ops.len(), 1);
+        assert_eq!(
+            ops[0],
+            PipeOp::Replace {
+                old: "/".to_string(),
+                new: "-".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_pipe_ops_chained() {
+        let ops = parse_pipe_ops("trim | toLower | trimPrefix \"pre\"");
+        assert_eq!(ops.len(), 3);
+        assert_eq!(ops[0], PipeOp::Trim);
+        assert_eq!(ops[1], PipeOp::ToLower);
+        assert_eq!(ops[2], PipeOp::TrimPrefix("pre".to_string()));
+    }
+
+    #[test]
+    fn test_apply_pipe_ops_trim_prefix() {
+        let value = serde_json::Value::String("refs/heads/main".to_string());
+        let ops = vec![PipeOp::TrimPrefix("refs/heads/".to_string())];
+        let result = apply_pipe_ops(value, &ops);
+        assert_eq!(result, serde_json::Value::String("main".to_string()));
+    }
+
+    #[test]
+    fn test_apply_pipe_ops_trim_suffix() {
+        let value = serde_json::Value::String("file.txt".to_string());
+        let ops = vec![PipeOp::TrimSuffix(".txt".to_string())];
+        let result = apply_pipe_ops(value, &ops);
+        assert_eq!(result, serde_json::Value::String("file".to_string()));
+    }
+
+    #[test]
+    fn test_apply_pipe_ops_to_lower() {
+        let value = serde_json::Value::String("HELLO".to_string());
+        let ops = vec![PipeOp::ToLower];
+        let result = apply_pipe_ops(value, &ops);
+        assert_eq!(result, serde_json::Value::String("hello".to_string()));
+    }
+
+    #[test]
+    fn test_apply_pipe_ops_to_upper() {
+        let value = serde_json::Value::String("hello".to_string());
+        let ops = vec![PipeOp::ToUpper];
+        let result = apply_pipe_ops(value, &ops);
+        assert_eq!(result, serde_json::Value::String("HELLO".to_string()));
+    }
+
+    #[test]
+    fn test_apply_pipe_ops_trim() {
+        let value = serde_json::Value::String("  hello  ".to_string());
+        let ops = vec![PipeOp::Trim];
+        let result = apply_pipe_ops(value, &ops);
+        assert_eq!(result, serde_json::Value::String("hello".to_string()));
+    }
+
+    #[test]
+    fn test_apply_pipe_ops_replace() {
+        let value = serde_json::Value::String("a/b/c".to_string());
+        let ops = vec![PipeOp::Replace {
+            old: "/".to_string(),
+            new: "-".to_string(),
+        }];
+        let result = apply_pipe_ops(value, &ops);
+        assert_eq!(result, serde_json::Value::String("a-b-c".to_string()));
+    }
+
+    #[test]
+    fn test_apply_pipe_ops_default_empty() {
+        let value = serde_json::Value::String("".to_string());
+        let ops = vec![PipeOp::Default("fallback".to_string())];
+        let result = apply_pipe_ops(value, &ops);
+        assert_eq!(result, serde_json::Value::String("fallback".to_string()));
+    }
+
+    #[test]
+    fn test_apply_pipe_ops_default_null() {
+        let value = serde_json::Value::Null;
+        let ops = vec![PipeOp::Default("fallback".to_string())];
+        let result = apply_pipe_ops(value, &ops);
+        assert_eq!(result, serde_json::Value::String("fallback".to_string()));
+    }
+
+    #[test]
+    fn test_apply_pipe_ops_default_non_empty() {
+        let value = serde_json::Value::String("value".to_string());
+        let ops = vec![PipeOp::Default("fallback".to_string())];
+        let result = apply_pipe_ops(value, &ops);
+        assert_eq!(result, serde_json::Value::String("value".to_string()));
+    }
+
+    #[test]
+    fn test_apply_pipe_ops_to_json() {
+        let value = serde_json::json!({"key": "value"});
+        let ops = vec![PipeOp::ToJson];
+        let result = apply_pipe_ops(value, &ops);
+        assert_eq!(
+            result,
+            serde_json::Value::String("{\"key\":\"value\"}".to_string())
+        );
+    }
+
+    #[test]
+    fn test_apply_pipe_ops_chained() {
+        let value = serde_json::Value::String("  HELLO  ".to_string());
+        let ops = vec![PipeOp::Trim, PipeOp::ToLower];
+        let result = apply_pipe_ops(value, &ops);
+        assert_eq!(result, serde_json::Value::String("hello".to_string()));
+    }
+
+    #[test]
+    fn test_evaluate_template_with_pipe_trim_prefix() {
+        let payload = serde_json::json!({
+            "ref": "refs/heads/main"
+        });
+
+        let result = evaluate_template("{{ .ref | trimPrefix \"refs/heads/\" }}", &payload);
+        assert_eq!(
+            result,
+            Some(serde_json::Value::String("main".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_evaluate_template_with_pipe_chained() {
+        let payload = serde_json::json!({
+            "name": "  HELLO  "
+        });
+
+        let result = evaluate_template("{{ .name | trim | toLower }}", &payload);
+        assert_eq!(
+            result,
+            Some(serde_json::Value::String("hello".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_evaluate_template_with_pipe_replace() {
+        let payload = serde_json::json!({
+            "path": "a/b/c"
+        });
+
+        let result = evaluate_template("{{ .path | replace \"/\" \"-\" }}", &payload);
+        assert_eq!(
+            result,
+            Some(serde_json::Value::String("a-b-c".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_evaluate_template_with_pipe_default() {
+        let payload = serde_json::json!({
+            "empty": ""
+        });
+
+        let result = evaluate_template("{{ .empty | default \"fallback\" }}", &payload);
+        assert_eq!(
+            result,
+            Some(serde_json::Value::String("fallback".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_map_inputs_with_pipe_operations() {
+        let payload = serde_json::json!({
+            "ref": "refs/heads/feature-branch",
+            "name": "  TEST  "
+        });
+
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "branch".to_string(),
+            "{{ .ref | trimPrefix \"refs/heads/\" }}".to_string(),
+        );
+        mappings.insert("normalized_name".to_string(), "{{ .name | trim | toLower }}".to_string());
+
+        let inputs = map_inputs(&mappings, &payload);
+
+        assert_eq!(
+            inputs.get("branch"),
+            Some(&serde_json::Value::String("feature-branch".to_string()))
+        );
+        assert_eq!(
+            inputs.get("normalized_name"),
+            Some(&serde_json::Value::String("test".to_string()))
+        );
+    }
+
+    // Test: Non-string values pass through string operations unchanged (no-op + warn behavior)
+    #[test]
+    fn test_pipe_ops_non_string_passthrough() {
+        // String operations on non-string values should pass through unchanged
+        let number = serde_json::json!(42);
+        let array = serde_json::json!([1, 2, 3]);
+        let object = serde_json::json!({"key": "value"});
+
+        // trimPrefix on number - passes through
+        let result = apply_pipe_ops(number.clone(), &[PipeOp::TrimPrefix("pre".to_string())]);
+        assert_eq!(result, number);
+
+        // toLower on array - passes through
+        let result = apply_pipe_ops(array.clone(), &[PipeOp::ToLower]);
+        assert_eq!(result, array);
+
+        // trim on object - passes through
+        let result = apply_pipe_ops(object.clone(), &[PipeOp::Trim]);
+        assert_eq!(result, object);
+
+        // replace on number - passes through
+        let result = apply_pipe_ops(number.clone(), &[PipeOp::Replace {
+            old: "a".to_string(),
+            new: "b".to_string(),
+        }]);
+        assert_eq!(result, number);
+    }
+
+    // Test: Universal operations work on any type
+    #[test]
+    fn test_pipe_ops_universal_operations() {
+        // toJson works on any type
+        let number = serde_json::json!(42);
+        let result = apply_pipe_ops(number, &[PipeOp::ToJson]);
+        assert_eq!(result, serde_json::Value::String("42".to_string()));
+
+        let array = serde_json::json!([1, 2, 3]);
+        let result = apply_pipe_ops(array, &[PipeOp::ToJson]);
+        assert_eq!(result, serde_json::Value::String("[1,2,3]".to_string()));
+
+        // default works on null
+        let null = serde_json::Value::Null;
+        let result = apply_pipe_ops(null, &[PipeOp::Default("fallback".to_string())]);
+        assert_eq!(result, serde_json::Value::String("fallback".to_string()));
+
+        // default passes through non-empty non-null values
+        let number = serde_json::json!(42);
+        let result = apply_pipe_ops(number.clone(), &[PipeOp::Default("fallback".to_string())]);
+        assert_eq!(result, number);
     }
 }
