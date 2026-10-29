@@ -25,7 +25,16 @@ import logs from "./commands/logs";
 import inject from "./commands/inject";
 import describe from "./commands/describe";
 import { registerCheckCommand } from "./commands/check";
+import { registerInitCommand } from "./commands/init";
+import { registerSealCommand } from "./commands/seal";
+import { registerAttestCommand } from "./commands/attest";
+import { registerVerifyCommand } from "./commands/verify-cmd";
+import { registerLogCommand } from "./commands/log-cmd";
+import { registerCbStatusCommand } from "./commands/cb-status";
+import { registerImportCommand } from "./commands/import";
+import { registerAgentCommand } from "./commands/agent";
 import { startTUI } from "./tui";
+import { s } from "./lib/symbols";
 
 const VERSION = "0.1.0";
 
@@ -125,7 +134,7 @@ program
 
         console.log("\n" + chalk.red.bold("Errors:"));
         for (const error of result.errors) {
-          console.log(chalk.red(`  ✗ [${error.code}] ${error.message}`));
+          console.log(chalk.red(`  ${s.cross} [${error.code}] ${error.message}`));
         }
         process.exit(1);
       }
@@ -133,7 +142,7 @@ program
       if (result.warnings.length > 0) {
         console.log("\n" + chalk.yellow.bold("Warnings:"));
         for (const warning of result.warnings) {
-          console.log(chalk.yellow(`  ⚠ [${warning.code}] ${warning.message}`));
+          console.log(chalk.yellow(`  ${s.warn} [${warning.code}] ${warning.message}`));
         }
       }
     } catch (error) {
@@ -171,7 +180,7 @@ program
 
         if (options.output) {
           await Bun.write(options.output, output);
-          console.log(chalk.green(`✓ Written to ${options.output}`));
+          console.log(chalk.green(`${s.check} Written to ${options.output}`));
         } else {
           console.log("\n" + output);
         }
@@ -226,7 +235,7 @@ program
         if (!validation.valid) {
           spinner.fail("Validation failed");
           for (const err of validation.errors) {
-            console.error(chalk.red(`  ✗ ${err.message}`));
+            console.error(chalk.red(`  ${s.cross} ${err.message}`));
           }
           process.exit(1);
         }
@@ -300,26 +309,26 @@ program
           for await (const status of client.watchRun(runResult.runId)) {
             const icon =
               status.status === "completed"
-                ? chalk.green("✓")
+                ? chalk.green(s.check)
                 : status.status === "failed"
-                  ? chalk.red("✗")
+                  ? chalk.red(s.cross)
                   : chalk.blue("⟳");
 
             console.log(`${icon} Status: ${status.status}`);
 
             if (status.status === "completed") {
-              console.log(chalk.green("\n✓ Workflow completed"));
+              console.log(chalk.green(`\n${s.check} Workflow completed`));
               break;
             }
             if (status.status === "failed") {
-              console.log(chalk.red("\n✗ Workflow failed"));
+              console.log(chalk.red(`\n${s.cross} Workflow failed`));
               if (status.error) {
                 console.error(chalk.red(`  ${status.error.message}`));
               }
               process.exit(1);
             }
             if (status.status === "cancelled") {
-              console.log(chalk.yellow("\n⊘ Workflow cancelled"));
+              console.log(chalk.yellow(`\n${s.skip} Workflow cancelled`));
               break;
             }
           }
@@ -336,55 +345,8 @@ program
     },
   );
 
-// Status command
-program
-  .command("status <runId>")
-  .description("Get status of a workflow run")
-  .option("-w, --watch", "Watch for updates")
-  .action(async (runId: string, options: { watch?: boolean }, cmd: Command) => {
-    const globalOpts = cmd.optsWithGlobals();
-
-    const client = new CircuitBreakerClient({
-      baseUrl: globalOpts.apiUrl,
-      apiKey: globalOpts.apiKey,
-    });
-
-    try {
-      if (options.watch) {
-        console.log(chalk.dim(`Watching run ${runId}...\n`));
-
-        for await (const status of client.watchRun(runId)) {
-          console.clear();
-          console.log(chalk.bold(`Run: ${runId}`));
-          console.log(`Status: ${status.status}`);
-          console.log(`Workflow: ${status.workflowName}`);
-
-          if (["completed", "failed", "cancelled"].includes(status.status)) {
-            break;
-          }
-        }
-      } else {
-        const status = await client.getRunStatus(runId);
-
-        if (globalOpts.output === "json") {
-          console.log(JSON.stringify(status, null, 2));
-        } else {
-          console.log(chalk.bold(`Run: ${runId}`));
-          console.log(`  Status:   ${status.status}`);
-          console.log(`  Workflow: ${status.workflowName}`);
-          console.log(`  Started:  ${status.startedAt}`);
-          if (status.completedAt) {
-            console.log(`  Completed: ${status.completedAt}`);
-          }
-        }
-      }
-    } catch (error) {
-      console.error(
-        chalk.red(`Error: ${error instanceof Error ? error.message : error}`),
-      );
-      process.exit(1);
-    }
-  });
+// Status command — `cb status` shows inner-loop status; `cb status <runId>` shows outer-loop run
+registerCbStatusCommand(program);
 
 // Logs command
 program
@@ -453,7 +415,7 @@ program
       const controllerExists = await Bun.file(controllerPath).exists();
 
       if (!apiExists || !runnerExists || !controllerExists) {
-        console.log(chalk.yellow("⚠ Rust binaries not found. Building..."));
+        console.log(chalk.yellow(`${s.warn} Rust binaries not found. Building...`));
         console.log(chalk.dim(`  Engine directory: ${engineDir}`));
 
         const buildProc = Bun.spawn(
@@ -476,10 +438,10 @@ program
 
         const exitCode = await buildProc.exited;
         if (exitCode !== 0) {
-          console.error(chalk.red("✗ Failed to build Rust binaries"));
+          console.error(chalk.red(`${s.cross} Failed to build Rust binaries`));
           process.exit(1);
         }
-        console.log(chalk.green("✓ Build complete\n"));
+        console.log(chalk.green(`${s.check} Build complete\n`));
       }
 
       // Cleanup function
@@ -502,9 +464,9 @@ program
             m.connect({ servers: options.natsUrl, timeout: 1000 }),
           );
           await nc.close();
-          console.log(chalk.green("✓ NATS already running"));
+          console.log(chalk.green(`${s.check} NATS already running`));
         } catch {
-          console.log(chalk.yellow("⚠ NATS not running at " + options.natsUrl));
+          console.log(chalk.yellow(`${s.warn} NATS not running at ${options.natsUrl}`));
           console.log(chalk.dim("  Starting NATS server..."));
 
           // Try to start NATS
@@ -517,11 +479,11 @@ program
 
             // Wait a moment for NATS to start
             await new Promise((resolve) => setTimeout(resolve, 1000));
-            console.log(chalk.green("✓ NATS server started"));
+            console.log(chalk.green(`${s.check} NATS server started`));
           } catch {
             console.error(
               chalk.red(
-                "✗ Failed to start NATS. Please install nats-server or start it manually.",
+                `${s.cross} Failed to start NATS. Please install nats-server or start it manually.`,
               ),
             );
             console.log(chalk.dim("  brew install nats-server"));
@@ -543,7 +505,7 @@ program
       // Wait for API to be ready
       await new Promise((resolve) => setTimeout(resolve, 500));
       console.log(
-        chalk.green(`✓ API server started on port ${options.apiPort}`),
+        chalk.green(`${s.check} API server started on port ${options.apiPort}`),
       );
 
       // Start cb-controller
@@ -557,7 +519,7 @@ program
 
       // Wait for controller to be ready
       await new Promise((resolve) => setTimeout(resolve, 500));
-      console.log(chalk.green("✓ Controller started"));
+      console.log(chalk.green(`${s.check} Controller started`));
 
       // Start cb-runner
       console.log(chalk.dim("  Starting runner..."));
@@ -570,9 +532,9 @@ program
 
       // Wait for runner to be ready
       await new Promise((resolve) => setTimeout(resolve, 500));
-      console.log(chalk.green("✓ Runner started"));
+      console.log(chalk.green(`${s.check} Runner started`));
 
-      console.log(chalk.bold.green("\n✓ All services running!\n"));
+      console.log(chalk.bold.green(`\n${s.check} All services running!\n`));
       console.log(chalk.dim("Press Ctrl+C to stop all services\n"));
 
       // Launch TUI
@@ -584,8 +546,15 @@ program
     },
   );
 
-// Check command — run GitHub Actions locally
+// Inner loop commands — init, import, seal, check, attest, verify, log
+registerInitCommand(program);
+registerImportCommand(program);
+registerAgentCommand(program);
+registerSealCommand(program);
 registerCheckCommand(program);
+registerAttestCommand(program);
+registerVerifyCommand(program);
+registerLogCommand(program);
 
 // Health command
 program
@@ -601,11 +570,11 @@ program
 
     try {
       const health = await client.health();
-      console.log(chalk.green("✓ API is healthy"));
+      console.log(chalk.green(`${s.check} API is healthy`));
       console.log(`  Status:  ${health.status}`);
       console.log(`  Version: ${health.version}`);
     } catch (error) {
-      console.error(chalk.red("✗ API is unreachable"));
+      console.error(chalk.red(`${s.cross} API is unreachable`));
       console.error(
         chalk.red(`  ${error instanceof Error ? error.message : error}`),
       );

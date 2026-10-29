@@ -11,6 +11,7 @@
 
 import type { Command } from "commander";
 import chalk from "chalk";
+import { s } from "../lib/symbols";
 
 interface InjectOptions {
   data?: string;
@@ -99,7 +100,7 @@ export async function inject(
     }
 
     // Pretty print the result
-    console.log(chalk.green("✓ Token injected successfully"));
+    console.log(chalk.green(`${s.check} Token injected successfully`));
     console.log();
     console.log(`${chalk.cyan("Run ID:")}      ${result.runId}`);
     console.log(`${chalk.cyan("Place:")}       ${result.placeId}`);
@@ -177,7 +178,7 @@ async function showPlaceSchema(
   }
 
   console.log(chalk.bold(`Token Schema for place: ${placeId}`));
-  console.log(chalk.dim("─".repeat(50)));
+  console.log(chalk.dim("-".repeat(50)));
   console.log();
 
   if (place.tokenSchema) {

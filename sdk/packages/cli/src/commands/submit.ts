@@ -9,6 +9,7 @@ import { resolve, extname } from 'path';
 import { WorkflowSchema, type Workflow } from '@circuit-breaker/core';
 import { CircuitBreakerClient } from '@circuit-breaker/core';
 import { validateWorkflow } from '@circuit-breaker/core';
+import { s } from "../lib/symbols";
 
 interface SubmitOptions {
   /** Watch for completion after submit */
@@ -156,13 +157,13 @@ function printValidation(workflow: Workflow, format: 'text' | 'json'): boolean {
   }
 
   if (result.valid) {
-    console.log('✓ Workflow is valid');
+    console.log(`${s.check} Workflow is valid`);
     console.log(`  Name: ${workflow.name}`);
     console.log(`  Namespace: ${workflow.namespace}`);
     console.log(`  Places: ${workflow.places.length}`);
     console.log(`  Transitions: ${workflow.transitions.length}`);
   } else {
-    console.error('✗ Workflow validation failed:');
+    console.error(`${s.cross} Workflow validation failed:`);
     for (const error of result.errors) {
       console.error(`  - [${error.code}] ${error.message}`);
     }
@@ -280,16 +281,16 @@ export async function submitCommand(args: string[]): Promise<void> {
           }
 
           if (status.status === 'completed') {
-            console.log('\n✓ Workflow completed successfully');
+            console.log('\n' + s.check + ' Workflow completed successfully');
             break;
           } else if (status.status === 'failed') {
-            console.error('\n✗ Workflow failed');
+            console.error('\n' + s.cross + ' Workflow failed');
             if (status.error) {
               console.error(`  Error: ${status.error.message}`);
             }
             process.exit(1);
           } else if (status.status === 'cancelled') {
-            console.log('\n⊘ Workflow was cancelled');
+            console.log('\n' + s.skip + ' Workflow was cancelled');
             break;
           }
         }

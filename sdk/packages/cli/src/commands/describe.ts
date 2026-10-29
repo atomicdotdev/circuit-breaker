@@ -98,7 +98,7 @@ export async function describe(
 
     // Pretty print
     console.log(chalk.bold(`Workflow: ${runStatus.workflowName}`));
-    console.log(chalk.dim("─".repeat(60)));
+    console.log(chalk.dim("-".repeat(60)));
     console.log();
 
     console.log(`${chalk.cyan("Run ID:")}     ${runStatus.runId}`);
@@ -170,7 +170,7 @@ export async function describe(
     }
 
     console.log();
-    console.log(chalk.dim("─".repeat(60)));
+    console.log(chalk.dim("-".repeat(60)));
     console.log();
     console.log(chalk.dim("Commands:"));
     console.log(

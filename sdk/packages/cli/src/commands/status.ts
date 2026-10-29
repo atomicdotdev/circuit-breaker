@@ -5,6 +5,7 @@
  */
 
 import { CircuitBreakerClient } from '@circuit-breaker/core';
+import { s } from "../lib/symbols";
 
 interface StatusOptions {
   watch?: boolean;
@@ -68,9 +69,9 @@ function printStatus(
   // Table/text format
   const statusIcon =
     status.status === 'completed'
-      ? '✓'
+      ? s.check
       : status.status === 'failed'
-        ? '✗'
+        ? s.cross
         : status.status === 'running'
           ? '⟳'
           : '○';
@@ -97,9 +98,9 @@ function printStatus(
   for (const t of status.transitions) {
     const icon =
       t.status === 'completed'
-        ? '✓'
+        ? s.check
         : t.status === 'failed'
-          ? '✗'
+          ? s.cross
           : t.status === 'firing'
             ? '⟳'
             : t.status === 'retrying'

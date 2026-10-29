@@ -16,6 +16,9 @@
     "fmt": "bun run --filter '*' fmt",
     "clean": "bun run --filter '*' clean"
   },
+  "dependencies": {
+    "@circuit-breaker/core": "workspace:*"
+  },
   "devDependencies": {
     "@types/bun": "^1.0.0",
     "typescript": "^5.3.0",

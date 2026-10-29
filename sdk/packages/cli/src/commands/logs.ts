@@ -56,7 +56,7 @@ export async function logs(
       console.log(chalk.bold(`Logs for run: ${runId}`));
       console.log(chalk.dim(`Workflow: ${status.workflowName}`));
       console.log(chalk.dim(`Status: ${status.status}`));
-      console.log(chalk.dim("─".repeat(60)));
+      console.log(chalk.dim("-".repeat(60)));
       console.log();
     }
 
@@ -122,7 +122,7 @@ export async function logs(
         if (log.output) {
           console.log();
           console.log(chalk.cyan("Output:"));
-          console.log(chalk.dim("─".repeat(40)));
+          console.log(chalk.dim("-".repeat(40)));
 
           // Pretty print the output
           if (typeof log.output === "object") {
@@ -144,7 +144,7 @@ export async function logs(
             console.log(String(log.output));
           }
 
-          console.log(chalk.dim("─".repeat(40)));
+          console.log(chalk.dim("-".repeat(40)));
         }
 
         console.log();
@@ -202,7 +202,7 @@ export async function logs(
           ["completed", "failed", "cancelled"].includes(currentStatus.status)
         ) {
           console.log();
-          console.log(chalk.dim("─".repeat(60)));
+          console.log(chalk.dim("-".repeat(60)));
 
           const finalColor =
             currentStatus.status === "completed"
@@ -217,7 +217,7 @@ export async function logs(
       }
     }
 
-    console.log(chalk.dim("─".repeat(60)));
+    console.log(chalk.dim("-".repeat(60)));
   } catch (error) {
     if (error instanceof Error) {
       console.error(chalk.red(`Error: ${error.message}`));

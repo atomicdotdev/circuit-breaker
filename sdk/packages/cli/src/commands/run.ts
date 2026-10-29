@@ -9,6 +9,7 @@ import chalk from 'chalk';
 import ora from 'ora';
 import { resolve, extname } from 'path';
 import {
+import { s } from "../lib/symbols";
   WorkflowSchema,
   CircuitBreakerClient,
   validateWorkflow,
@@ -116,7 +117,7 @@ export async function run(
     if (!validation.valid) {
       spinner.fail('Workflow validation failed');
       for (const error of validation.errors) {
-        console.error(chalk.red(`  ✗ [${error.code}] ${error.message}`));
+        console.error(chalk.red(`  ${s.cross} [${error.code}] ${error.message}`));
       }
       process.exit(1);
     }
@@ -126,7 +127,7 @@ export async function run(
     if (validation.warnings.length > 0) {
       console.log(chalk.yellow('\nWarnings:'));
       for (const warning of validation.warnings) {
-        console.log(chalk.yellow(`  ⚠ [${warning.code}] ${warning.message}`));
+        console.log(chalk.yellow(`  ${s.warn} [${warning.code}] ${warning.message}`));
       }
     }
 
@@ -153,13 +154,13 @@ export async function run(
     });
     spinner.succeed(`Started run: ${chalk.cyan(runResult.runId)}`);
 
-    console.log('\n' + chalk.dim('─'.repeat(50)));
+    console.log('\n' + chalk.dim('-'.repeat(50)));
     console.log(`  ${chalk.bold('Run ID:')}      ${runResult.runId}`);
     console.log(`  ${chalk.bold('Workflow:')}    ${workflow.name}`);
     console.log(`  ${chalk.bold('Namespace:')}   ${workflow.namespace}`);
     console.log(`  ${chalk.bold('Status:')}      ${chalk.blue(runResult.status)}`);
     console.log(`  ${chalk.bold('Started At:')}  ${runResult.startedAt}`);
-    console.log(chalk.dim('─'.repeat(50)) + '\n');
+    console.log(chalk.dim('-'.repeat(50)) + '\n');
 
     // Watch if requested
     if (options.watch) {
@@ -184,11 +185,11 @@ export async function run(
           // Log transition updates
           for (const t of status.transitions) {
             if (t.status === 'firing') {
-              console.log(`  ${chalk.yellow('▶')} ${t.transitionId}: executing...`);
+              console.log(`  ${chalk.yellow(s.play)} ${t.transitionId}: executing...`);
             } else if (t.status === 'completed') {
-              console.log(`  ${chalk.green('✓')} ${t.transitionId}: completed`);
+              console.log(`  ${chalk.green(s.check)} ${t.transitionId}: completed`);
             } else if (t.status === 'failed') {
-              console.log(`  ${chalk.red('✗')} ${t.transitionId}: failed`);
+              console.log(`  ${chalk.red(s.cross)} ${t.transitionId}: failed`);
             }
           }
 
@@ -197,7 +198,7 @@ export async function run(
 
         // Handle terminal states
         if (status.status === 'completed') {
-          console.log('\n' + chalk.green('✓ Workflow completed successfully'));
+          console.log(chalk.green(`\n${s.check} Workflow completed successfully`));
           if (status.currentMarking) {
             console.log(chalk.dim('\nFinal marking:'));
             for (const [place, tokens] of Object.entries(status.currentMarking)) {
@@ -210,7 +211,7 @@ export async function run(
         }
 
         if (status.status === 'failed') {
-          console.log('\n' + chalk.red('✗ Workflow failed'));
+          console.log(chalk.red(`\n${s.cross} Workflow failed`));
           if (status.error) {
             console.error(chalk.red(`  Error: ${status.error.message}`));
             if (status.error.transition) {
@@ -221,7 +222,7 @@ export async function run(
         }
 
         if (status.status === 'cancelled') {
-          console.log('\n' + chalk.yellow('⊘ Workflow was cancelled'));
+          console.log(chalk.yellow(`\n${s.skip} Workflow was cancelled`));
           return;
         }
       }
